@@ -1,7 +1,7 @@
 /* ==========================================================================
    CADERNO DE ESTUDOS — script.js
    Etapa 1/5: estrutura, IndexedDB, navegação, CRUD de assuntos, tema.
-   (Materiais, Questões, Anotações, Pesquisa e Backup vêm nas próximas etapas)
+   (Materiais, Questões, Pesquisa e Backup vêm nas próximas etapas)
    ========================================================================== */
 
 /* ============================================================
@@ -34,8 +34,14 @@ const state = {
   currentTab: "materiais",
   currentPagina: 1,
   objectURLs: [], // URLs de imagens criadas com createObjectURL, para revogar depois
-  filtros: { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" },
+  filtros: { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" },
   respostasVisiveis: new Map(), // id da questão -> true/false (resposta e comentários visíveis)
+  ordem: "sequencial",          // "sequencial" (ordem em que foram inseridas) ou "aleatoria"
+  ordemAleatoria: null,         // lista de ids na ordem embaralhada atual
+  desempPeriodo: "hoje",        // painel de desempenho: hoje | ontem | 7d | 30d | tudo | data
+  desempData: "",               // "AAAA-MM-DD" quando o período é uma data específica
+  desempOrdem: "assunto",       // assunto | pior | melhor | mais
+  desempAba: "questoes",        // painel de desempenho: questoes | flash
 };
 
 const QUESTOES_POR_PAGINA = 10;
@@ -285,6 +291,10 @@ let accordionAberto = null;
 // sessão de revisão de flashcards em andamento (null = fora da revisão)
 let flashSessao = null;
 
+// seleção múltipla na lista de flashcards (null = modo normal)
+// formato: { assuntoId, ids: Set<number> }
+let flashSelecao = null;
+
 /* ============================================================
    2. INDEXEDDB — abertura e helpers genéricos
    ============================================================ */
@@ -443,7 +453,9 @@ function openModal(innerHTML) {
 
 function closeModal() {
   document.getElementById("modal-overlay").hidden = true;
-  document.getElementById("modal-box").innerHTML = "";
+  const box = document.getElementById("modal-box");
+  box.innerHTML = "";
+  box.classList.remove("modal-wide", "modal-editor");
 }
 
 document.getElementById("modal-overlay").addEventListener("click", (e) => {
@@ -464,6 +476,7 @@ function escapeHTML(str) {
    ============================================================ */
 
 function showView(viewId) {
+  if (viewId !== "view-assunto" && typeof fecharPlayerAudio === "function") fecharPlayerAudio(); // para o áudio ao sair do assunto
   document.querySelectorAll(".view").forEach(v => v.hidden = true);
   document.getElementById(viewId).hidden = false;
 
@@ -472,7 +485,10 @@ function showView(viewId) {
 }
 
 document.getElementById("btn-voltar").addEventListener("click", () => {
-  if (!document.getElementById("view-assunto").hidden) {
+  if (!document.getElementById("view-desempenho").hidden) {
+    // volta do painel de desempenho para a lista de assuntos da matéria
+    goToMateria(state.currentMateriaId);
+  } else if (!document.getElementById("view-assunto").hidden) {
     // volta da tela de assunto para a lista de assuntos da matéria
     document.getElementById("app-title").textContent = "📘 Caderno de Estudos";
     goToMateria(state.currentMateriaId);
@@ -514,7 +530,7 @@ document.getElementById("btn-roteiro").addEventListener("click", goToRoteiro);
 async function goToAssunto(assuntoId) {
   state.currentAssuntoId = assuntoId;
   state.currentPagina = 1;
-  state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" };
+  state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" };
   const assunto = await dbGet("assuntos", assuntoId);
   document.getElementById("app-title").textContent = `📄 ${assunto.nome}`;
   showView("view-assunto");
@@ -597,7 +613,7 @@ async function renderHome() {
       <div class="materia-card-stats">
         <span class="stat-pill">📂 <b>${stats.assuntos}</b> assuntos</span>
         <span class="stat-pill">❓ <b>${stats.questoes}</b> questões</span>
-        <span class="stat-pill">📎 <b>${stats.pdfs}</b> PDFs</span>
+        <span class="stat-pill">📎 <b>${stats.pdfs}</b> materiais</span>
         ${stats.taxaAcerto !== null ? `<span class="stat-pill" title="${stats.tentativas} revisões registradas">🎯 <b>${stats.taxaAcerto}%</b> de acerto</span>` : ""}
       </div>
       ${stats.questoes > 0 ? `
@@ -754,7 +770,7 @@ function confirmDeleteAssunto(assunto) {
   openModal(`
     <h3 class="modal-title">Excluir "${escapeHTML(assunto.nome)}"?</h3>
     <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 4px;">
-      Isso também excluirá todos os PDFs, questões, flashcards e anotações deste assunto. Essa ação não pode ser desfeita.
+      Isso também excluirá todos os PDFs, questões e flashcards deste assunto. Essa ação não pode ser desfeita.
     </p>
     <div class="modal-actions">
       <button class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
@@ -785,6 +801,387 @@ async function deleteAssuntoCascade(assuntoId) {
 }
 
 /* ============================================================
+   6B. DESEMPENHO DA MATÉRIA — acertos e erros por assunto e por dia
+   Usa o histórico que já existe em questao.tentativas = [{ em, acertou }].
+   ============================================================ */
+
+document.getElementById("btn-desempenho").addEventListener("click", () => {
+  if (state.currentMateriaId) goToDesempenho(state.currentMateriaId);
+});
+
+async function goToDesempenho(materiaId) {
+  const materia = getMateriaById(materiaId);
+  if (!materia) { goToHome(); return; }
+  state.currentMateriaId = materiaId;
+  state.currentAssuntoId = null;
+  document.getElementById("app-title").textContent = `📊 Desempenho — ${materia.nome}`;
+  showView("view-desempenho");
+  await renderDesempenho(materiaId);
+}
+
+// "AAAA-MM-DD" no fuso local
+function chaveDia(ts) {
+  const d = new Date(ts);
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+
+function intervaloDesempenho() {
+  const p = state.desempPeriodo;
+  if (p === "hoje") return [inicioDoDia(0), inicioDoDia(1)];
+  if (p === "ontem") return [inicioDoDia(-1), inicioDoDia(0)];
+  if (p === "7d") return [inicioDoDia(-6), inicioDoDia(1)];
+  if (p === "30d") return [inicioDoDia(-29), inicioDoDia(1)];
+  if (p === "data" && state.desempData) {
+    const [a, m, d] = state.desempData.split("-").map(Number);
+    return [new Date(a, m - 1, d).getTime(), new Date(a, m - 1, d + 1).getTime()];
+  }
+  return [0, Infinity];
+}
+
+function rotuloPeriodoDesempenho() {
+  const fmt = (ts) => new Date(ts).toLocaleDateString("pt-BR");
+  const p = state.desempPeriodo;
+  if (p === "hoje") return `Hoje (${fmt(inicioDoDia(0))})`;
+  if (p === "ontem") return `Ontem (${fmt(inicioDoDia(-1))})`;
+  if (p === "7d") return `Últimos 7 dias (${fmt(inicioDoDia(-6))} a ${fmt(inicioDoDia(0))})`;
+  if (p === "30d") return `Últimos 30 dias (${fmt(inicioDoDia(-29))} a ${fmt(inicioDoDia(0))})`;
+  if (p === "data" && state.desempData) {
+    const [a, m, d] = state.desempData.split("-").map(Number);
+    return fmt(new Date(a, m - 1, d).getTime());
+  }
+  return "Todo o período";
+}
+
+function classeTaxa(taxa) {
+  if (taxa === null) return "";
+  if (taxa >= 70) return "taxa-boa";
+  if (taxa >= 50) return "taxa-media";
+  return "taxa-ruim";
+}
+
+// ---------- coleta de atividade: questões (tentativas) + flashcards (revisões) ----------
+function revisoesDoFlashcard(f) {
+  if (Array.isArray(f.historico) && f.historico.length) return f.historico.filter(h => typeof h.em === "number");
+  // cartão antigo (antes do histórico): só sabemos a última revisão
+  if (typeof f.ultimaRevisao === "number") return [{ em: f.ultimaRevisao, nota: null }];
+  return [];
+}
+
+// uma "unidade" por assunto da matéria: { id, nome, assuntoId, tent: [...], revs: [...] }
+async function coletarUnidadesDaMateria(materiaId) {
+  const assuntos = await dbGetAll("assuntos", "materiaId", materiaId);
+  assuntos.sort((a, b) => (a.ordem ?? 0) - (b.ordem ?? 0));
+  const unidades = [];
+  for (const a of assuntos) {
+    const questoes = await dbGetAll("questoes", "assuntoId", a.id);
+    const cards = await dbGetAll("flashcards", "assuntoId", a.id);
+    const tent = [];
+    for (const q of questoes) for (const t of (q.tentativas || [])) if (typeof t.em === "number") tent.push(t);
+    const revs = [];
+    for (const f of cards) revs.push(...revisoesDoFlashcard(f));
+    unidades.push({ id: a.id, nome: a.nome, assuntoId: a.id, tent, revs });
+  }
+  return unidades;
+}
+
+// uma "unidade" por matéria do roteiro atual (soma de todos os assuntos)
+async function coletarUnidadesPorMateria() {
+  const unidades = [];
+  for (const m of MATERIAS) {
+    const subs = await coletarUnidadesDaMateria(m.id);
+    unidades.push({
+      id: m.id, materiaId: m.id, nome: `${m.icone} ${m.nome}`,
+      tent: subs.flatMap(u => u.tent),
+      revs: subs.flatMap(u => u.revs),
+    });
+  }
+  return unidades;
+}
+
+async function renderDesempenho(materiaId) {
+  const el = document.getElementById("desempenho-container");
+  const unidades = await coletarUnidadesDaMateria(materiaId);
+  montarPainelDesempenho(el, unidades, {
+    rotuloUnidade: "Assunto",
+    mostrarZeros: false,
+    vazioHTML: `
+      <div class="empty-state">
+        <span class="empty-emoji">📊</span>
+        <p>Ainda não há questões respondidas nem flashcards revisados nesta matéria.</p>
+        <p>Nas questões, clique em "Acertei" ou "Errei"; nos flashcards, faça uma revisão para o desempenho aparecer aqui.</p>
+      </div>`,
+    dicaQuestoes: "Abrir as questões deste assunto",
+    dicaFlash: "Abrir os flashcards deste assunto",
+    rerender: () => renderDesempenho(materiaId),
+    aoClicar: async (u, tipo) => {
+      await goToAssunto(u.assuntoId);
+      setActiveTab(tipo === "flash" ? "flashcards" : "questoes");
+    },
+  });
+}
+
+/* ---------- DESEMPENHO GERAL (todas as matérias do roteiro atual) ---------- */
+document.getElementById("btn-desempenho-geral").addEventListener("click", goToDesempenhoGeral);
+
+async function goToDesempenhoGeral() {
+  if (!getConcursoAtual() || MATERIAS.length === 0) {
+    showToast("Este roteiro ainda não tem matérias.");
+    return;
+  }
+  state.currentMateriaId = null;
+  state.currentAssuntoId = null;
+  const c = getConcursoAtual();
+  document.getElementById("app-title").textContent = `📊 Desempenho geral — ${c.nome}`;
+  showView("view-desempenho");
+  await renderDesempenhoGeral();
+}
+
+async function renderDesempenhoGeral() {
+  const el = document.getElementById("desempenho-container");
+  const unidades = await coletarUnidadesPorMateria();
+  montarPainelDesempenho(el, unidades, {
+    rotuloUnidade: "Matéria",
+    mostrarZeros: true, // mostra também as matérias sem atividade, para ver onde falta estudar
+    vazioHTML: `
+      <div class="empty-state">
+        <span class="empty-emoji">📊</span>
+        <p>Ainda não há questões respondidas nem flashcards revisados neste roteiro.</p>
+        <p>Assim que você estudar, o desempenho de todas as matérias aparece aqui.</p>
+      </div>`,
+    dicaQuestoes: "Ver o desempenho desta matéria",
+    dicaFlash: "Ver o desempenho desta matéria",
+    rerender: renderDesempenhoGeral,
+    aoClicar: (u) => goToDesempenho(u.materiaId),
+  });
+}
+
+/* ---------- painel compartilhado (matéria e geral), com abas Questões / Flashcards ---------- */
+function montarPainelDesempenho(el, unidadesTodas, cfg) {
+  const aba = state.desempAba === "flash" ? "flash" : "questoes";
+  const ehFlash = aba === "flash";
+
+  // só os dados da aba escolhida: tudo abaixo (cards, faixa de dias, tabela) usa apenas eles
+  const unidades = unidadesTodas.map(u => ({ ...u, tent: ehFlash ? [] : u.tent, revs: ehFlash ? u.revs : [] }));
+
+  const abasHTML = `
+    <div class="tabs-bar desemp-abas">
+      <button class="desemp-aba ${!ehFlash ? "active" : ""}" data-aba="questoes">❓ Questões</button>
+      <button class="desemp-aba ${ehFlash ? "active" : ""}" data-aba="flash">🃏 Flashcards</button>
+    </div>`;
+
+  const ligarAbas = () => {
+    el.querySelectorAll(".desemp-aba").forEach(btn => {
+      btn.addEventListener("click", () => {
+        if (state.desempAba === btn.dataset.aba) return;
+        state.desempAba = btn.dataset.aba;
+        cfg.rerender();
+      });
+    });
+  };
+
+  // atividade por dia na aba escolhida: n = itens, ok = acertos / lembrados
+  const dias = new Map(); // "AAAA-MM-DD" -> { n, ok }
+  const doDia = (k) => {
+    let o = dias.get(k);
+    if (!o) { o = { n: 0, ok: 0 }; dias.set(k, o); }
+    return o;
+  };
+  for (const u of unidades) {
+    for (const t of u.tent) { const o = doDia(chaveDia(t.em)); o.n++; if (t.acertou) o.ok++; }
+    for (const r of u.revs) { const o = doDia(chaveDia(r.em)); o.n++; if (r.nota && r.nota !== "errei") o.ok++; }
+  }
+
+  if (dias.size === 0) {
+    el.innerHTML = abasHTML + (ehFlash ? `
+      <div class="empty-state">
+        <span class="empty-emoji">🃏</span>
+        <p>Ainda não há flashcards revisados ${cfg.rotuloUnidade === "Matéria" ? "neste roteiro" : "nesta matéria"}.</p>
+        <p>Faça uma revisão na aba Flashcards de um assunto para o desempenho aparecer aqui.</p>
+      </div>` : `
+      <div class="empty-state">
+        <span class="empty-emoji">❓</span>
+        <p>Ainda não há questões respondidas ${cfg.rotuloUnidade === "Matéria" ? "neste roteiro" : "nesta matéria"}.</p>
+        <p>Nas questões, clique em "Acertei" ou "Errei" para o desempenho aparecer aqui.</p>
+      </div>`);
+    ligarAbas();
+    return;
+  }
+
+  // ---- números do período escolhido ----
+  const [ini, fim] = intervaloDesempenho();
+  const noPeriodo = (x) => x.em >= ini && x.em < fim;
+  const linhas = unidades.map(u => {
+    if (!ehFlash) {
+      const tp = u.tent.filter(noPeriodo);
+      const ac = tp.filter(t => t.acertou).length;
+      return { u, total: tp.length, acertos: ac, erros: tp.length - ac, semNota: 0, taxa: tp.length ? Math.round((ac / tp.length) * 100) : null };
+    }
+    const rp = u.revs.filter(noPeriodo);
+    const err = rp.filter(r => r.nota === "errei").length;
+    const ok = rp.filter(r => r.nota && r.nota !== "errei").length;
+    const den = ok + err;
+    return { u, total: rp.length, acertos: ok, erros: err, semNota: rp.length - den, taxa: den ? Math.round((ok / den) * 100) : null };
+  });
+  const soma = (campo) => linhas.reduce((n, l) => n + l[campo], 0);
+  const total = soma("total"), acertos = soma("acertos"), erros = soma("erros"), semNota = soma("semNota");
+  const den = ehFlash ? acertos + erros : total;
+  const taxaGeral = den ? Math.round((acertos / den) * 100) : null;
+
+  const ordem = state.desempOrdem;
+  let lista = cfg.mostrarZeros ? linhas.slice() : linhas.filter(l => l.total > 0);
+  const ocultas = linhas.length - lista.length;
+  if (ordem === "pior") lista.sort((a, b) => (a.taxa ?? 101) - (b.taxa ?? 101) || b.total - a.total);
+  else if (ordem === "melhor") lista.sort((a, b) => (b.taxa ?? -1) - (a.taxa ?? -1) || b.total - a.total);
+  else if (ordem === "mais") lista.sort((a, b) => b.total - a.total);
+  // "assunto" mantém a ordem do cadastro
+
+  // ---- sequência de dias estudando (na aba escolhida) ----
+  let sequencia = 0;
+  const cursor = new Date();
+  cursor.setHours(0, 0, 0, 0);
+  if (!dias.has(chaveDia(cursor.getTime()))) cursor.setDate(cursor.getDate() - 1);
+  while (dias.has(chaveDia(cursor.getTime()))) {
+    sequencia++;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+
+  // ---- faixa dos últimos 14 dias ----
+  const nivel = (n) => (n === 0 ? 0 : n < 5 ? 1 : n < 10 ? 2 : n < 20 ? 3 : 4);
+  let faixaHTML = "";
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - i);
+    const k = chaveDia(d.getTime());
+    const info = dias.get(k) || { n: 0, ok: 0 };
+    const selecionado = state.desempPeriodo === "data" && state.desempData === k;
+    const dica = info.n
+      ? (ehFlash
+          ? `${d.toLocaleDateString("pt-BR")}: ${info.n} flashcard(s) revisado(s)`
+          : `${d.toLocaleDateString("pt-BR")}: ${info.n} respondida(s) — ${info.ok} acerto(s), ${info.n - info.ok} erro(s)`)
+      : `${d.toLocaleDateString("pt-BR")}: nenhuma atividade`;
+    faixaHTML += `
+      <button class="desemp-dia nivel-${nivel(info.n)} ${selecionado ? "selecionado" : ""}" data-dia="${k}" title="${dica}">
+        <span class="desemp-dia-sem">${DIAS_SEMANA[d.getDay()].slice(0, 3)}</span>
+        <span class="desemp-dia-num">${d.getDate()}</span>
+        <span class="desemp-dia-qtd">${info.n || "·"}</span>
+      </button>`;
+  }
+
+  const pills = [["hoje", "Hoje"], ["ontem", "Ontem"], ["7d", "7 dias"], ["30d", "30 dias"], ["tudo", "Tudo"]]
+    .map(([v, t]) => `<button class="pagina-pill desemp-pill ${state.desempPeriodo === v ? "active" : ""}" data-periodo="${v}">${t}</button>`)
+    .join("");
+
+  const barra = (taxa) => taxa === null
+    ? `<span class="desemp-barra"></span><b>—</b>`
+    : `<span class="desemp-barra"><span class="desemp-barra-ok" style="width:${taxa}%"></span></span><b>${taxa}%</b>`;
+
+  const linhaHTML = (l) => `
+    <div class="desemp-linha ${l.total === 0 ? "desemp-linha-vazia" : ""}" data-unidade="${l.u.id}" data-tipo="${aba}" title="${escapeHTML(ehFlash ? cfg.dicaFlash : cfg.dicaQuestoes)}">
+      <span class="desemp-nome">${escapeHTML(l.u.nome)}</span>
+      <span class="desemp-num">${l.total}</span>
+      <span class="desemp-num desemp-acerto">${l.acertos}</span>
+      <span class="desemp-num desemp-erro">${l.erros}</span>
+      <span class="desemp-taxa ${classeTaxa(l.taxa)}">${barra(l.taxa)}</span>
+    </div>`;
+
+  const cab = ehFlash ? ["Revis.", "Lembrei", "Errei", "% lembrança"] : ["Resp.", "Acertos", "Erros", "% de acerto"];
+  const nomeUnidades = cfg.rotuloUnidade === "Matéria" ? ["matéria", "matérias"] : ["assunto", "assuntos"];
+
+  const cardsHTML = ehFlash ? `
+      <div class="desemp-card"><span class="desemp-card-valor">${total}</span><span class="desemp-card-rotulo">revisões</span></div>
+      <div class="desemp-card ok"><span class="desemp-card-valor">${acertos}</span><span class="desemp-card-rotulo">lembrei ✅</span></div>
+      <div class="desemp-card erro"><span class="desemp-card-valor">${erros}</span><span class="desemp-card-rotulo">errei ❌</span></div>
+      <div class="desemp-card ${classeTaxa(taxaGeral)}"><span class="desemp-card-valor">${taxaGeral === null ? "—" : taxaGeral + "%"}</span><span class="desemp-card-rotulo">de lembrança</span></div>`
+    : `
+      <div class="desemp-card"><span class="desemp-card-valor">${total}</span><span class="desemp-card-rotulo">respondidas</span></div>
+      <div class="desemp-card ok"><span class="desemp-card-valor">${acertos}</span><span class="desemp-card-rotulo">acertos ✅</span></div>
+      <div class="desemp-card erro"><span class="desemp-card-valor">${erros}</span><span class="desemp-card-rotulo">erros ❌</span></div>
+      <div class="desemp-card ${classeTaxa(taxaGeral)}"><span class="desemp-card-valor">${taxaGeral === null ? "—" : taxaGeral + "%"}</span><span class="desemp-card-rotulo">de acerto</span></div>`;
+
+  el.innerHTML = `
+    ${abasHTML}
+
+    <div class="desemp-controles">
+      <div class="desemp-pills">${pills}</div>
+      <label class="desemp-data">
+        <span>📅 Dia específico:</span>
+        <input type="date" id="desemp-data" value="${state.desempPeriodo === "data" ? state.desempData : ""}" max="${chaveDia(Date.now())}">
+      </label>
+    </div>
+
+    <h3 class="desemp-titulo">${escapeHTML(rotuloPeriodoDesempenho())} <small>· ${sequencia} ${sequencia === 1 ? "dia seguido" : "dias seguidos"} ${ehFlash ? "revisando" : "resolvendo questões"} 🔥</small></h3>
+
+    <div class="desemp-resumo quatro">${cardsHTML}</div>
+
+    <h3 class="desemp-titulo">Últimos 14 dias <small>(clique em um dia para filtrar)</small></h3>
+    <div class="desemp-faixa">${faixaHTML}</div>
+
+    <div class="view-header-row desemp-tabela-topo">
+      <h3 class="desemp-titulo" style="margin:0;">Detalhes por ${cfg.rotuloUnidade.toLowerCase()}</h3>
+      <select class="select-mini" id="desemp-ordem" title="Ordenar">
+        <option value="assunto" ${ordem === "assunto" ? "selected" : ""}>Ordem do cadastro</option>
+        <option value="pior" ${ordem === "pior" ? "selected" : ""}>Pior desempenho primeiro</option>
+        <option value="melhor" ${ordem === "melhor" ? "selected" : ""}>Melhor desempenho primeiro</option>
+        <option value="mais" ${ordem === "mais" ? "selected" : ""}>Mais atividade primeiro</option>
+      </select>
+    </div>
+
+    ${lista.length === 0 ? `
+      <div class="empty-state">
+        <span class="empty-emoji">🗓️</span>
+        <p>${ehFlash ? "Nenhum flashcard revisado neste período." : "Nenhuma questão respondida neste período."}</p>
+      </div>` : `
+      <div class="desemp-tabela">
+        <div class="desemp-linha desemp-cabecalho">
+          <span class="desemp-nome">${cfg.rotuloUnidade}</span>
+          <span class="desemp-num">${cab[0]}</span>
+          <span class="desemp-num desemp-acerto">${cab[1]}</span>
+          <span class="desemp-num desemp-erro">${cab[2]}</span>
+          <span class="desemp-taxa">${cab[3]}</span>
+        </div>
+        ${lista.map(linhaHTML).join("")}
+      </div>
+      ${ocultas > 0 ? `<p class="desemp-rodape">${ocultas} ${ocultas === 1 ? nomeUnidades[0] : nomeUnidades[1]} sem atividade neste período.</p>` : ""}
+      ${ehFlash && semNota > 0 ? `<p class="desemp-rodape">${semNota} revisão(ões) antiga(s), feitas antes do histórico existir, entram só na coluna "Revis." (a nota não foi registrada).</p>` : ""}
+    `}
+  `;
+
+  // ---- eventos ----
+  ligarAbas();
+  el.querySelectorAll(".desemp-pill").forEach(btn => {
+    btn.addEventListener("click", () => {
+      state.desempPeriodo = btn.dataset.periodo;
+      state.desempData = "";
+      cfg.rerender();
+    });
+  });
+  el.querySelectorAll(".desemp-dia").forEach(btn => {
+    btn.addEventListener("click", () => {
+      state.desempPeriodo = "data";
+      state.desempData = btn.dataset.dia;
+      cfg.rerender();
+    });
+  });
+  document.getElementById("desemp-data").addEventListener("change", (e) => {
+    if (!e.target.value) return;
+    state.desempPeriodo = "data";
+    state.desempData = e.target.value;
+    cfg.rerender();
+  });
+  document.getElementById("desemp-ordem").addEventListener("change", (e) => {
+    state.desempOrdem = e.target.value;
+    cfg.rerender();
+  });
+  el.querySelectorAll(".desemp-linha[data-unidade]").forEach(linha => {
+    linha.addEventListener("click", () => {
+      const u = unidades.find(x => String(x.id) === linha.dataset.unidade);
+      if (u) cfg.aoClicar(u, linha.dataset.tipo);
+    });
+  });
+}
+
+/* ============================================================
    7. TELA DO ASSUNTO — ABAS (esqueleto; conteúdo nas próximas etapas)
    ============================================================ */
 
@@ -804,8 +1201,6 @@ function setActiveTab(tabName) {
     renderMateriaisTab(state.currentAssuntoId);
   } else if (tabName === "flashcards") {
     renderFlashcardsTab(state.currentAssuntoId);
-  } else if (tabName === "anotacoes") {
-    renderAnotacoesTab(state.currentAssuntoId);
   }
 }
 
@@ -857,7 +1252,8 @@ async function renderQuestoesTab(assuntoId) {
 
   const { status, dificuldade, favorito } = state.filtros;
   const desempenho = state.filtros.desempenho || "todos";
-  const filtroAtivo = status !== "todos" || dificuldade !== "todos" || favorito || desempenho !== "todos";
+  const respondidas = state.filtros.respondidas || "todos";
+  const filtroAtivo = status !== "todos" || dificuldade !== "todos" || favorito || desempenho !== "todos" || respondidas !== "todos";
 
   const filtradas = comNumero.filter(q => {
     if (status !== "todos" && q.status !== status) return false;
@@ -869,8 +1265,18 @@ async function renderQuestoesTab(assuntoId) {
       if (desempenho === "errei_ultima" && !(r.ultima && !r.ultima.acertou)) return false;
       if (desempenho === "ja_errei" && r.erros === 0) return false;
     }
+    if (respondidas !== "todos") {
+      const n = resumoTentativas(q).total; // quantas vezes a questão foi respondida
+      if (respondidas === "1-3" && !(n >= 1 && n <= 3)) return false;
+      if (respondidas === "3-5" && !(n >= 3 && n <= 5)) return false;
+      if (respondidas === "5-7" && !(n >= 5 && n <= 7)) return false;
+      if (respondidas === "7+" && !(n >= 7)) return false;
+    }
     return true;
   });
+
+  // ordem: sequencial (padrão, como foram inseridas) ou aleatória (embaralhada)
+  if (state.ordem === "aleatoria") ordenarAleatoriamente(filtradas, comNumero);
 
   const totalPaginas = Math.max(1, Math.ceil(filtradas.length / QUESTOES_POR_PAGINA));
   if (state.currentPagina > totalPaginas) state.currentPagina = totalPaginas;
@@ -879,6 +1285,11 @@ async function renderQuestoesTab(assuntoId) {
   container.innerHTML = `
     <div class="questoes-toolbar">
       <div class="filtros-questoes">
+        <select class="select-mini" id="select-ordem" title="Ordem das questões">
+          <option value="sequencial" ${state.ordem === "sequencial" ? "selected" : ""}>Ordem: sequencial</option>
+          <option value="aleatoria" ${state.ordem === "aleatoria" ? "selected" : ""}>Ordem: aleatória</option>
+        </select>
+        ${state.ordem === "aleatoria" ? `<button class="btn-toggle-favorito" id="btn-embaralhar" title="Sortear uma nova ordem">🔀 Embaralhar de novo</button>` : ""}
         <select class="select-mini" id="filtro-status">
           <option value="todos" ${status === "todos" ? "selected" : ""}>Todos os status</option>
           <option value="nao_respondida" ${status === "nao_respondida" ? "selected" : ""}>Não respondida</option>
@@ -897,6 +1308,13 @@ async function renderQuestoesTab(assuntoId) {
           <option value="errei_ultima" ${desempenho === "errei_ultima" ? "selected" : ""}>Errei na última vez</option>
           <option value="ja_errei" ${desempenho === "ja_errei" ? "selected" : ""}>Já errei alguma vez</option>
         </select>
+        <select class="select-mini" id="filtro-respondidas" title="Quantas vezes a questão foi respondida">
+          <option value="todos" ${respondidas === "todos" ? "selected" : ""}>Qtd. respondida: todas</option>
+          <option value="1-3" ${respondidas === "1-3" ? "selected" : ""}>Respondida 1 a 3 vezes</option>
+          <option value="3-5" ${respondidas === "3-5" ? "selected" : ""}>Respondida 3 a 5 vezes</option>
+          <option value="5-7" ${respondidas === "5-7" ? "selected" : ""}>Respondida 5 a 7 vezes</option>
+          <option value="7+" ${respondidas === "7+" ? "selected" : ""}>Respondida 7 vezes ou mais</option>
+        </select>
         <button class="btn-toggle-favorito ${favorito ? "active" : ""}" id="filtro-favorito" title="Só favoritas">⭐ Favoritas</button>
         ${filtroAtivo ? `<button class="btn-ghost" id="btn-limpar-filtros">Limpar filtros</button>` : ""}
       </div>
@@ -905,6 +1323,7 @@ async function renderQuestoesTab(assuntoId) {
           🖼️ Adicionar várias imagens
           <input type="file" id="input-imagens-lote" accept="image/png,image/jpeg,image/jpg,image/webp" multiple hidden>
         </label>
+        <button class="btn-secondary" id="btn-pdf-questoes" title="Exportar as imagens das questões em um único PDF">📄 PDF</button>
         <button class="btn-primary" id="btn-add-questao">+ Nova questão</button>
       </div>
     </div>
@@ -913,6 +1332,21 @@ async function renderQuestoesTab(assuntoId) {
     <div class="questoes-lista" id="questoes-lista"></div>
   `;
 
+  document.getElementById("select-ordem").addEventListener("change", (e) => {
+    state.ordem = e.target.value;
+    if (state.ordem === "aleatoria") state.ordemAleatoria = null; // sorteia uma ordem nova
+    state.currentPagina = 1;
+    renderQuestoesTab(assuntoId);
+  });
+  const btnEmbaralhar = document.getElementById("btn-embaralhar");
+  if (btnEmbaralhar) {
+    btnEmbaralhar.addEventListener("click", () => {
+      state.ordemAleatoria = null;
+      state.currentPagina = 1;
+      renderQuestoesTab(assuntoId);
+      showToast("Questões embaralhadas 🔀");
+    });
+  }
   document.getElementById("filtro-status").addEventListener("change", (e) => {
     state.filtros.status = e.target.value;
     state.currentPagina = 1;
@@ -928,6 +1362,11 @@ async function renderQuestoesTab(assuntoId) {
     state.currentPagina = 1;
     renderQuestoesTab(assuntoId);
   });
+  document.getElementById("filtro-respondidas").addEventListener("change", (e) => {
+    state.filtros.respondidas = e.target.value;
+    state.currentPagina = 1;
+    renderQuestoesTab(assuntoId);
+  });
   document.getElementById("filtro-favorito").addEventListener("click", () => {
     state.filtros.favorito = !state.filtros.favorito;
     state.currentPagina = 1;
@@ -936,12 +1375,13 @@ async function renderQuestoesTab(assuntoId) {
   const btnLimpar = document.getElementById("btn-limpar-filtros");
   if (btnLimpar) {
     btnLimpar.addEventListener("click", () => {
-      state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" };
+      state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" };
       state.currentPagina = 1;
       renderQuestoesTab(assuntoId);
     });
   }
   document.getElementById("btn-add-questao").addEventListener("click", () => adicionarQuestao(assuntoId));
+  document.getElementById("btn-pdf-questoes").addEventListener("click", () => abrirModalExportarPdfQuestoes(assuntoId));
   document.getElementById("input-imagens-lote").addEventListener("change", (e) => {
     const arquivos = Array.from(e.target.files || []);
     e.target.value = "";
@@ -995,7 +1435,41 @@ async function renderQuestoesTab(assuntoId) {
   questoesPagina.forEach((questao) => {
     listaEl.appendChild(criarQuestaoCard(questao, questao.numeroGlobal));
   });
+  listaEl.querySelectorAll(".questao-textarea").forEach(autoAjustarTextarea);
 }
+
+// Embaralha (Fisher-Yates) e mantém a mesma ordem enquanto você navega/edita,
+// só sorteia de novo quando você pede (ou troca para "aleatória").
+function ordenarAleatoriamente(lista, todas) {
+  const idsAtuais = todas.map(q => q.id);
+  let ordem = state.ordemAleatoria;
+  if (!ordem) {
+    ordem = idsAtuais.slice();
+    for (let i = ordem.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [ordem[i], ordem[j]] = [ordem[j], ordem[i]];
+    }
+  } else {
+    // questões novas entram no fim; questões apagadas saem
+    const existentes = new Set(idsAtuais);
+    ordem = ordem.filter(id => existentes.has(id));
+    const jaTem = new Set(ordem);
+    idsAtuais.forEach(id => { if (!jaTem.has(id)) ordem.push(id); });
+  }
+  state.ordemAleatoria = ordem;
+  const posicao = new Map(ordem.map((id, i) => [id, i]));
+  lista.sort((a, b) => posicao.get(a.id) - posicao.get(b.id));
+}
+
+// Faz a caixa de texto crescer até mostrar tudo, sem barra de rolagem interna.
+function autoAjustarTextarea(ta) {
+  if (!ta) return;
+  ta.style.height = "auto";
+  if (ta.scrollHeight > 0) ta.style.height = (ta.scrollHeight + 2) + "px";
+}
+window.addEventListener("resize", () => {
+  document.querySelectorAll(".questao-textarea").forEach(autoAjustarTextarea);
+});
 
 async function adicionarQuestao(assuntoId) {
   const novaQuestao = {
@@ -1011,7 +1485,7 @@ async function adicionarQuestao(assuntoId) {
   };
   await dbPut("questoes", novaQuestao);
   const questoes = await getQuestoesOrdenadas(assuntoId);
-  state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" };
+  state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" };
   state.currentPagina = Math.max(1, Math.ceil(questoes.length / QUESTOES_POR_PAGINA));
   showToast("Questão adicionada.");
   renderQuestoesTab(assuntoId);
@@ -1045,7 +1519,7 @@ async function adicionarQuestoesEmLote(assuntoId, arquivos) {
       });
     }
     const questoes = await getQuestoesOrdenadas(assuntoId);
-    state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" };
+    state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" };
     state.currentPagina = Math.max(1, Math.ceil(questoes.length / QUESTOES_POR_PAGINA));
     showToast(imagens.length === 1 ? "1 questão adicionada." : `${imagens.length} questões adicionadas.`);
     renderQuestoesTab(assuntoId);
@@ -1117,6 +1591,9 @@ function criarQuestaoCard(questao, numeroGlobal) {
     <button type="button" class="btn-toggle-resposta"></button>
 
     <div class="questao-revelavel">
+    <div class="questao-leitura-bar">
+      <button type="button" class="btn-ler-tela-cheia" title="Abrir resposta e comentários em tela cheia">🔍 Ler em tela cheia</button>
+    </div>
     <div class="questao-campos">
       <div>
         <label class="campo-label">Resposta</label>
@@ -1152,8 +1629,10 @@ function criarQuestaoCard(questao, numeroGlobal) {
     ? state.respostasVisiveis.get(questao.id)
     : visivelPadrao;
 
+  const ajustarCampos = () => card.querySelectorAll(".questao-textarea").forEach(autoAjustarTextarea);
   function aplicarVisibilidade() {
     camposEl.hidden = !visivel;
+    if (visivel) requestAnimationFrame(ajustarCampos);
     btnToggle.textContent = visivel ? "🙈 Esconder resposta e comentários" : "👁️ Mostrar resposta e comentários";
     btnToggle.classList.toggle("ativo", visivel);
   }
@@ -1261,6 +1740,7 @@ function criarQuestaoCard(questao, numeroGlobal) {
   // ---- resposta / comentário (autosave com debounce) ----
   let debounceResposta = null;
   card.querySelector(".textarea-resposta").addEventListener("input", (e) => {
+    autoAjustarTextarea(e.target);
     clearTimeout(debounceResposta);
     debounceResposta = setTimeout(async () => {
       questao.resposta = e.target.value;
@@ -1270,11 +1750,22 @@ function criarQuestaoCard(questao, numeroGlobal) {
 
   let debounceComentario = null;
   card.querySelector(".textarea-comentario").addEventListener("input", (e) => {
+    autoAjustarTextarea(e.target);
     clearTimeout(debounceComentario);
     debounceComentario = setTimeout(async () => {
       questao.comentario = e.target.value;
       await dbPut("questoes", questao);
     }, 500);
+  });
+
+  // ---- ler resposta e comentários em tela cheia ----
+  card.querySelector(".btn-ler-tela-cheia").addEventListener("click", () => {
+    abrirLeitorQuestao(
+      questao,
+      numeroGlobal,
+      card.querySelector(".textarea-resposta").value,
+      card.querySelector(".textarea-comentario").value
+    );
   });
 
   return card;
@@ -1318,6 +1809,75 @@ async function handleImagemSelecionada(event, areaEl, questao) {
   showToast("Imagem salva.");
 }
 
+// Leitor em tela cheia: mostra imagem, resposta e comentários em letra grande,
+// sem caixas pequenas — só a página rola. A, A− e A+ ajustam o tamanho da letra.
+const LEITOR_FONTE_MIN = 15, LEITOR_FONTE_MAX = 34;
+function abrirLeitorQuestao(questao, numero, resposta, comentario) {
+  let fonte = 20;
+  try { fonte = parseInt(localStorage.getItem("caderno-leitor-fonte"), 10) || 20; } catch (e) {}
+
+  const bloco = (titulo, texto) => `
+    <section class="leitor-bloco">
+      <h3 class="leitor-bloco-titulo">${titulo}</h3>
+      ${(texto || "").trim()
+        ? `<div class="leitor-texto">${escapeHTML(texto)}</div>`
+        : `<p class="leitor-vazio">Nada preenchido aqui ainda.</p>`}
+    </section>`;
+
+  let imgUrl = null;
+  if (questao.imagem) imgUrl = URL.createObjectURL(questao.imagem);
+
+  const overlay = document.createElement("div");
+  overlay.className = "leitor-overlay";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.innerHTML = `
+    <div class="leitor-painel">
+      <div class="leitor-topo">
+        <span class="leitor-titulo">Questão ${numero}</span>
+        <div class="leitor-controles">
+          <button type="button" class="leitor-btn" data-acao="menos" title="Diminuir letra">A−</button>
+          <button type="button" class="leitor-btn" data-acao="mais" title="Aumentar letra">A+</button>
+          <button type="button" class="leitor-btn leitor-fechar" data-acao="fechar">Fechar ✕</button>
+        </div>
+      </div>
+      ${imgUrl ? `<div class="leitor-imagem"><img src="${imgUrl}" alt="Imagem da questão ${numero}"></div>` : ""}
+      ${bloco("Resposta", resposta)}
+      ${bloco("Comentários", comentario)}
+    </div>
+  `;
+
+  function aplicarFonte() {
+    overlay.style.setProperty("--leitor-fonte", fonte + "px");
+    try { localStorage.setItem("caderno-leitor-fonte", String(fonte)); } catch (e) {}
+  }
+  aplicarFonte();
+
+  function fechar() {
+    document.removeEventListener("keydown", onKey, true);
+    document.body.style.overflow = prevOverflow;
+    overlay.remove();
+    if (imgUrl) URL.revokeObjectURL(imgUrl);
+  }
+  function onKey(e) {
+    if (e.key === "Escape") { e.stopPropagation(); fechar(); }
+  }
+  const prevOverflow = document.body.style.overflow;
+  document.body.style.overflow = "hidden";
+  document.addEventListener("keydown", onKey, true);
+
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) { fechar(); return; }
+    const acao = e.target.closest("[data-acao]")?.dataset.acao;
+    if (acao === "fechar") fechar();
+    if (acao === "mais") { fonte = Math.min(LEITOR_FONTE_MAX, fonte + 2); aplicarFonte(); }
+    if (acao === "menos") { fonte = Math.max(LEITOR_FONTE_MIN, fonte - 2); aplicarFonte(); }
+  });
+
+  document.body.appendChild(overlay);
+  overlay.querySelector(".leitor-fechar").focus();
+}
+
 function abrirLightbox(url) {
   const overlay = document.createElement("div");
   overlay.className = "lightbox-overlay";
@@ -1353,6 +1913,7 @@ function confirmDeleteQuestao(questao) {
 async function renderMateriaisTab(assuntoId) {
   if (!assuntoId) return;
   const container = document.getElementById("materiais-container");
+  fecharPlayerAudio();
 
   const materiais = await dbGetAll("materiais", "assuntoId", assuntoId);
   materiais.sort((a, b) => (a.adicionadoEm ?? 0) - (b.adicionadoEm ?? 0));
@@ -1360,18 +1921,29 @@ async function renderMateriaisTab(assuntoId) {
   container.innerHTML = `
     <div class="materiais-toolbar">
       <span style="font-size:13px; color:var(--text-secondary);">
-        ${materiais.length} PDF${materiais.length === 1 ? "" : "s"} nesse assunto
+        ${resumoMateriais(materiais)}
       </span>
-      <label class="btn-primary" style="cursor:pointer;">
-        + Adicionar PDF
-        <input type="file" accept="application/pdf,.pdf" hidden id="input-pdf">
-      </label>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn-secondary" id="btn-add-link">🔗 Adicionar link</button>
+        <label class="btn-secondary" style="cursor:pointer;" title="MP3, M4A, WAV, OGG... (ex.: Resumo em áudio do NotebookLM)">
+          🎧 Adicionar áudio
+          <input type="file" accept="audio/*,.mp3,.m4a,.wav,.ogg,.oga,.aac,.opus,.flac,.weba" hidden id="input-audio">
+        </label>
+        <label class="btn-primary" style="cursor:pointer;">
+          + Adicionar PDF
+          <input type="file" accept="application/pdf,.pdf" hidden id="input-pdf">
+        </label>
+      </div>
     </div>
     <div class="materiais-lista" id="materiais-lista"></div>
   `;
 
   document.getElementById("input-pdf").addEventListener("change", (e) => {
     handlePdfSelecionado(e, assuntoId);
+  });
+  document.getElementById("btn-add-link").addEventListener("click", () => abrirModalLink(assuntoId));
+  document.getElementById("input-audio").addEventListener("change", (e) => {
+    handleAudioSelecionado(e, assuntoId);
   });
 
   const listaEl = document.getElementById("materiais-lista");
@@ -1380,37 +1952,157 @@ async function renderMateriaisTab(assuntoId) {
     listaEl.innerHTML = `
       <div class="empty-state">
         <span class="empty-emoji">📎</span>
-        <p>Nenhum PDF adicionado ainda.</p>
-        <p>Clique em "Adicionar PDF" para enviar o primeiro material.</p>
+        <p>Nenhum material adicionado ainda.</p>
+        <p>Use "Adicionar PDF", "Adicionar link" ou "Adicionar áudio" para guardar seus materiais.</p>
       </div>`;
     return;
   }
 
   materiais.forEach(material => {
+    const ehLink = material.tipo === "link";
+    const ehAudio = material.tipo === "audio";
     const row = document.createElement("div");
     row.className = "material-row";
     row.innerHTML = `
       <div class="material-row-main">
-        <span class="material-icon">📄</span>
+        <span class="material-icon">${ehLink ? "🔗" : ehAudio ? "🎧" : "📄"}</span>
         <div class="material-info">
           <div class="material-nome">${escapeHTML(material.nome)}</div>
-          <div class="material-meta">${formatarTamanho(material.arquivo.size)} · adicionado em ${formatarData(material.adicionadoEm)}</div>
+          <div class="material-meta">${ehLink
+            ? `${escapeHTML(dominioDoLink(material.url))} · adicionado em ${formatarData(material.adicionadoEm)}`
+            : ehAudio
+              ? `${material.duracao ? formatarDuracao(material.duracao) + " · " : ""}${formatarTamanho(material.arquivo ? material.arquivo.size : 0)} · adicionado em ${formatarData(material.adicionadoEm)}`
+              : `${formatarTamanho(material.arquivo ? material.arquivo.size : 0)} · adicionado em ${formatarData(material.adicionadoEm)}`}</div>
         </div>
       </div>
       <div class="material-row-actions">
-        <button class="btn-icon btn-excluir-pdf" title="Excluir PDF">🗑️</button>
+        ${ehLink ? `<button class="btn-icon btn-editar-link" title="Editar link">✏️</button>` : ""}
+        ${ehAudio ? `<button class="btn-icon btn-renomear-audio" title="Renomear">✏️</button>` : ""}
+        <button class="btn-icon btn-excluir-pdf" title="${ehLink ? "Excluir link" : ehAudio ? "Excluir áudio" : "Excluir PDF"}">🗑️</button>
       </div>
     `;
     row.addEventListener("click", (e) => {
       if (e.target.closest(".material-row-actions")) return;
-      abrirPdf(material.arquivo);
+      if (ehLink) abrirLink(material.url);
+      else if (ehAudio) alternarPlayerAudio(row, material);
+      else abrirPdf(material.arquivo);
     });
+    if (ehAudio) {
+      row.querySelector(".btn-renomear-audio").addEventListener("click", (e) => {
+        e.stopPropagation();
+        abrirModalRenomearAudio(material);
+      });
+    }
+    if (ehLink) {
+      row.querySelector(".btn-editar-link").addEventListener("click", (e) => {
+        e.stopPropagation();
+        abrirModalLink(assuntoId, material);
+      });
+    }
     row.querySelector(".btn-excluir-pdf").addEventListener("click", (e) => {
       e.stopPropagation();
       confirmDeletePdf(material);
     });
     listaEl.appendChild(row);
   });
+}
+
+/* ---------- links nos materiais ---------- */
+
+function resumoMateriais(materiais) {
+  const links = materiais.filter(m => m.tipo === "link").length;
+  const audios = materiais.filter(m => m.tipo === "audio").length;
+  const pdfs = materiais.length - links - audios;
+  const partes = [];
+  partes.push(`${pdfs} PDF${pdfs === 1 ? "" : "s"}`);
+  partes.push(`${links} link${links === 1 ? "" : "s"}`);
+  partes.push(`${audios} áudio${audios === 1 ? "" : "s"}`);
+  return partes.join(" · ") + " nesse assunto";
+}
+
+// aceita "site.com/pagina" (sem https://) e só permite http/https
+function normalizarLink(txt) {
+  let t = (txt || "").trim();
+  if (!t) return null;
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(t)) t = "https://" + t;
+  try {
+    const u = new URL(t);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    if (!u.hostname.includes(".") && u.hostname !== "localhost") return null;
+    return u.href;
+  } catch (e) {
+    return null;
+  }
+}
+
+function dominioDoLink(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ""); } catch (e) { return url || ""; }
+}
+
+function abrirLink(url) {
+  window.open(url, "_blank", "noopener");
+}
+
+function abrirModalLink(assuntoId, material = null) {
+  const editando = !!material;
+  openModal(`
+    <h3 class="modal-title">${editando ? "Editar link" : "Adicionar link"}</h3>
+    <div class="modal-field">
+      <label for="link-url">Endereço (URL)</label>
+      <input type="text" id="link-url" class="modal-input" placeholder="https://..." autocomplete="off" inputmode="url">
+    </div>
+    <div class="modal-field">
+      <label for="link-nome">Nome (opcional)</label>
+      <input type="text" id="link-nome" class="modal-input" placeholder="Ex.: Videoaula de Princípios da Administração" autocomplete="off">
+    </div>
+    <p id="link-erro" style="font-size:13px; color:var(--danger, #d64545); margin:0;" hidden></p>
+    <div class="modal-actions">
+      <button class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
+      <button class="btn-primary" id="btn-salvar-link">${editando ? "Salvar" : "Adicionar"}</button>
+    </div>
+  `);
+
+  const inUrl = document.getElementById("link-url");
+  const inNome = document.getElementById("link-nome");
+  const erro = document.getElementById("link-erro");
+  if (editando) {
+    inUrl.value = material.url || "";
+    inNome.value = material.nome === dominioDoLink(material.url) ? "" : material.nome;
+  }
+
+  const salvar = async () => {
+    const url = normalizarLink(inUrl.value);
+    if (!url) {
+      erro.hidden = false;
+      erro.textContent = "Digite um endereço válido (ex.: https://exemplo.com/pagina).";
+      inUrl.focus();
+      return;
+    }
+    const nome = inNome.value.trim() || dominioDoLink(url);
+    if (editando) {
+      material.url = url;
+      material.nome = nome;
+      await dbPut("materiais", material);
+    } else {
+      await dbPut("materiais", {
+        assuntoId,
+        tipo: "link",
+        nome,
+        url,
+        arquivo: null,
+        adicionadoEm: Date.now(),
+      });
+    }
+    closeModal();
+    showToast(editando ? "Link atualizado." : "Link adicionado.");
+    renderMateriaisTab(assuntoId);
+  };
+
+  document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
+  document.getElementById("btn-salvar-link").addEventListener("click", salvar);
+  [inUrl, inNome].forEach(el => el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); salvar(); }
+  }));
 }
 
 async function handlePdfSelecionado(event, assuntoId) {
@@ -1436,6 +2128,139 @@ function abrirPdf(arquivoBlob) {
   // não revogamos imediatamente para não quebrar a aba recém-aberta com o PDF
 }
 
+/* ---------- áudios nos materiais (ex.: resumo em áudio do NotebookLM) ---------- */
+
+let audioPlayerAtual = null;       // { row, box, url } — só um player aberto por vez
+let audioVelocidade = 1;           // lembra a velocidade escolhida
+
+function fecharPlayerAudio() {
+  if (!audioPlayerAtual) return;
+  const { row, box, url } = audioPlayerAtual;
+  const audio = box.querySelector("audio");
+  if (audio) { audio.pause(); audio.removeAttribute("src"); audio.load(); }
+  box.remove();
+  URL.revokeObjectURL(url);
+  if (row) row.classList.remove("material-tocando");
+  audioPlayerAtual = null;
+}
+
+function alternarPlayerAudio(row, material) {
+  const eraEste = audioPlayerAtual && audioPlayerAtual.material === material.id;
+  fecharPlayerAudio();
+  if (eraEste || !material.arquivo) return;
+
+  const url = URL.createObjectURL(material.arquivo);
+  const box = document.createElement("div");
+  box.className = "audio-player-box";
+  box.style.cssText = "margin:-4px 0 4px; padding:12px 14px; background:var(--bg-elevated); border:1px solid var(--border); border-radius:var(--radius-md); display:flex; align-items:center; gap:12px; flex-wrap:wrap;";
+  box.innerHTML = `
+    <audio controls preload="metadata" style="flex:1; min-width:200px; max-width:100%;"></audio>
+    <label style="font-size:12.5px; color:var(--text-secondary); display:flex; align-items:center; gap:6px;">
+      Velocidade
+      <select class="select-mini audio-vel">
+        ${[0.75, 1, 1.25, 1.5, 1.75, 2].map(v => `<option value="${v}" ${v === audioVelocidade ? "selected" : ""}>${v}x</option>`).join("")}
+      </select>
+    </label>
+  `;
+  const audio = box.querySelector("audio");
+  audio.src = url;
+  audio.playbackRate = audioVelocidade;
+  audio.addEventListener("loadedmetadata", () => { audio.playbackRate = audioVelocidade; });
+  box.querySelector(".audio-vel").addEventListener("change", (e) => {
+    audioVelocidade = parseFloat(e.target.value) || 1;
+    audio.playbackRate = audioVelocidade;
+  });
+  audio.addEventListener("error", () => {
+    showToast("Não consegui tocar esse áudio neste aparelho. Tente converter para MP3.");
+  });
+
+  row.after(box);
+  row.classList.add("material-tocando");
+  audioPlayerAtual = { row, box, url, material: material.id };
+  audio.play().catch(() => {});
+}
+
+function formatarDuracao(seg) {
+  seg = Math.round(seg);
+  const h = Math.floor(seg / 3600), m = Math.floor((seg % 3600) / 60), s = seg % 60;
+  const mm = String(m).padStart(h ? 2 : 1, "0"), ss = String(s).padStart(2, "0");
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+// descobre a duração do arquivo (se o navegador conseguir ler); não trava se falhar
+function lerDuracaoAudio(file) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const a = new Audio();
+    let fim = false;
+    const terminar = (v) => {
+      if (fim) return;
+      fim = true;
+      URL.revokeObjectURL(url);
+      resolve(v);
+    };
+    a.preload = "metadata";
+    a.onloadedmetadata = () => terminar(isFinite(a.duration) ? a.duration : null);
+    a.onerror = () => terminar(null);
+    setTimeout(() => terminar(null), 4000);
+    a.src = url;
+  });
+}
+
+async function handleAudioSelecionado(event, assuntoId) {
+  const files = [...event.target.files];
+  event.target.value = "";
+  if (!files.length) return;
+  const validos = files.filter(f => f.type.startsWith("audio/") || /\.(mp3|m4a|wav|ogg|oga|aac|opus|flac|weba|mp4)$/i.test(f.name));
+  if (!validos.length) {
+    showToast("Escolha um arquivo de áudio (MP3, M4A, WAV, OGG...).");
+    return;
+  }
+  showToast(validos.length === 1 ? "Salvando áudio..." : `Salvando ${validos.length} áudios...`);
+  for (const file of validos) {
+    const duracao = await lerDuracaoAudio(file);
+    await dbPut("materiais", {
+      assuntoId,
+      tipo: "audio",
+      nome: file.name.replace(/\.[^.]+$/, ""),
+      arquivo: file,
+      duracao,
+      adicionadoEm: Date.now(),
+    });
+  }
+  showToast(validos.length === 1 ? "Áudio adicionado 🎧" : `${validos.length} áudios adicionados 🎧`);
+  renderMateriaisTab(assuntoId);
+}
+
+function abrirModalRenomearAudio(material) {
+  openModal(`
+    <h3 class="modal-title">Renomear áudio</h3>
+    <div class="modal-field">
+      <label for="audio-nome">Nome</label>
+      <input type="text" id="audio-nome" class="modal-input" autocomplete="off">
+    </div>
+    <div class="modal-actions">
+      <button class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
+      <button class="btn-primary" id="btn-salvar-audio">Salvar</button>
+    </div>
+  `);
+  const inp = document.getElementById("audio-nome");
+  inp.value = material.nome;
+  inp.select();
+  const salvar = async () => {
+    const nome = inp.value.trim();
+    if (!nome) { inp.focus(); return; }
+    material.nome = nome;
+    await dbPut("materiais", material);
+    closeModal();
+    showToast("Áudio renomeado.");
+    renderMateriaisTab(material.assuntoId);
+  };
+  document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
+  document.getElementById("btn-salvar-audio").addEventListener("click", salvar);
+  inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); salvar(); } });
+}
+
 function confirmDeletePdf(material) {
   openModal(`
     <h3 class="modal-title">Excluir "${escapeHTML(material.nome)}"?</h3>
@@ -1449,9 +2274,10 @@ function confirmDeletePdf(material) {
   `);
   document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
   document.getElementById("btn-confirm-delete").addEventListener("click", async () => {
+    if (audioPlayerAtual && audioPlayerAtual.material === material.id) fecharPlayerAudio();
     await dbDelete("materiais", material.id);
     closeModal();
-    showToast("PDF excluído.");
+    showToast(material.tipo === "link" ? "Link excluído." : material.tipo === "audio" ? "Áudio excluído." : "PDF excluído.");
     renderMateriaisTab(material.assuntoId);
   });
 }
@@ -1466,40 +2292,6 @@ function formatarData(timestamp) {
   if (!timestamp) return "";
   const d = new Date(timestamp);
   return d.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" });
-}
-
-/* ============================================================
-   7D. ABA ANOTAÇÕES — editor simples de texto, com autosave
-   ============================================================ */
-
-async function renderAnotacoesTab(assuntoId) {
-  if (!assuntoId) return;
-  const container = document.getElementById("anotacoes-container");
-  const anotacao = await dbGet("anotacoes", assuntoId);
-  const texto = anotacao ? anotacao.texto : "";
-
-  container.innerHTML = `
-    <div class="anotacoes-toolbar">
-      <span class="anotacoes-status" id="anotacoes-status">
-        ${anotacao && anotacao.atualizadoEm ? "Salvo em " + formatarDataHora(anotacao.atualizadoEm) : "Comece a escrever..."}
-      </span>
-    </div>
-    <textarea id="anotacoes-editor" class="anotacoes-editor" placeholder="Escreva livremente suas anotações sobre esse assunto — resumos, macetes, fórmulas, o que quiser. É salvo automaticamente.">${escapeHTML(texto)}</textarea>
-  `;
-
-  const editor = document.getElementById("anotacoes-editor");
-  const statusEl = document.getElementById("anotacoes-status");
-  let debounceAnotacao = null;
-
-  editor.addEventListener("input", () => {
-    statusEl.textContent = "Salvando...";
-    clearTimeout(debounceAnotacao);
-    debounceAnotacao = setTimeout(async () => {
-      const agora = Date.now();
-      await dbPut("anotacoes", { assuntoId, texto: editor.value, atualizadoEm: agora });
-      statusEl.textContent = "Salvo em " + formatarDataHora(agora);
-    }, 500);
-  });
 }
 
 function formatarDataHora(timestamp) {
@@ -1564,66 +2356,358 @@ async function renderFlashcardsTab(assuntoId) {
   if (!assuntoId) return;
   const container = document.getElementById("flashcards-container");
   const cards = await getFlashcardsOrdenados(assuntoId);
-  const pendentes = cards.filter(flashcardPendente);
 
-  container.innerHTML = `
-    <div class="flash-toolbar">
-      <span class="flash-toolbar-info">
-        <b>${cards.length}</b> flashcard${cards.length === 1 ? "" : "s"} ·
-        <b>${pendentes.length}</b> para revisar hoje
-      </span>
-      <div class="flash-toolbar-actions">
+  // descarta seleção de outro assunto e ids que não existem mais
+  if (flashSelecao && flashSelecao.assuntoId !== assuntoId) flashSelecao = null;
+  if (flashSelecao) {
+    const existentes = new Set(cards.map(c => c.id));
+    flashSelecao.ids.forEach(id => { if (!existentes.has(id)) flashSelecao.ids.delete(id); });
+  }
+
+  const desenhar = () => {
+    const pendentes = cards.filter(flashcardPendente);
+    const selecionando = !!flashSelecao;
+    const nSel = selecionando ? flashSelecao.ids.size : 0;
+    const todosMarcados = selecionando && cards.length > 0 && nSel === cards.length;
+
+    const info = selecionando
+      ? `<b>${nSel}</b> selecionado${nSel === 1 ? "" : "s"} de <b>${cards.length}</b>`
+      : `<b>${cards.length}</b> flashcard${cards.length === 1 ? "" : "s"} ·
+         <b>${pendentes.length}</b> para revisar hoje`;
+
+    const acoes = selecionando
+      ? `
+        <button class="btn-ghost" id="btn-sel-todos">${todosMarcados ? "Desmarcar todos" : "Selecionar todos"}</button>
+        <button class="btn-secondary" id="btn-exportar-sel" ${nSel === 0 ? "disabled" : ""}>🗂️ Exportar (${nSel})</button>
+        <button class="btn-secondary" id="btn-pdf-sel" ${nSel === 0 ? "disabled" : ""}>📄 PDF (${nSel})</button>
+        <button class="btn-danger" id="btn-excluir-sel" ${nSel === 0 ? "disabled" : ""}>🗑️ Excluir (${nSel})</button>
+        <button class="btn-secondary" id="btn-sel-cancelar">Cancelar</button>`
+      : `
         ${cards.length > 0 && pendentes.length < cards.length
           ? `<button class="btn-ghost" id="btn-revisar-todos">Revisar todos</button>` : ""}
         ${pendentes.length > 0
           ? `<button class="btn-primary" id="btn-revisar">▶ Revisar (${pendentes.length})</button>` : ""}
-        <button class="${pendentes.length > 0 ? "btn-secondary" : "btn-primary"}" id="btn-add-flashcard">+ Novo flashcard</button>
+        ${cards.length > 0
+          ? `<button class="btn-secondary" id="btn-selecionar-flash" title="Selecionar vários flashcards para excluir ou exportar">☑ Selecionar</button>
+             <button class="btn-secondary" id="btn-exportar-assunto" title="Exportar os flashcards deste assunto para o Anki (.apkg)">🗂️ Exportar</button>
+             <button class="btn-secondary" id="btn-pdf-assunto" title="Exportar os flashcards deste assunto em PDF">📄 PDF</button>` : ""}
+        <button class="btn-secondary" id="btn-import-flashcards" title="Importar flashcards de um texto ou arquivo (ex.: gerados por uma IA)">⭱ Importar</button>
+        <button class="${pendentes.length > 0 ? "btn-secondary" : "btn-primary"}" id="btn-add-flashcard">+ Novo flashcard</button>`;
+
+    container.innerHTML = `
+      <div class="flash-toolbar">
+        <span class="flash-toolbar-info">${info}</span>
+        <div class="flash-toolbar-actions">${acoes}</div>
       </div>
-    </div>
-    <div class="flash-lista" id="flash-lista"></div>
-  `;
+      <div class="flash-lista" id="flash-lista"></div>
+    `;
 
-  document.getElementById("btn-add-flashcard").addEventListener("click", () => abrirModalFlashcard(assuntoId));
-  const btnRevisar = document.getElementById("btn-revisar");
-  if (btnRevisar) btnRevisar.addEventListener("click", () => iniciarRevisao(assuntoId, false));
-  const btnTodos = document.getElementById("btn-revisar-todos");
-  if (btnTodos) btnTodos.addEventListener("click", () => iniciarRevisao(assuntoId, true));
+    const $ = (id) => document.getElementById(id);
+    const on = (id, fn) => { const el = $(id); if (el) el.addEventListener("click", fn); };
 
-  const listaEl = document.getElementById("flash-lista");
+    on("btn-add-flashcard", () => abrirModalFlashcard(assuntoId));
+    on("btn-import-flashcards", () => abrirModalImportarFlashcards(assuntoId));
+    on("btn-revisar", () => iniciarRevisao(assuntoId, false));
+    on("btn-revisar-todos", () => iniciarRevisao(assuntoId, true));
+    on("btn-exportar-assunto", () => abrirModalExportarAnki({ assuntoId }));
+    on("btn-pdf-assunto", () => abrirModalExportarPdf({ assuntoId }));
 
-  if (cards.length === 0) {
-    listaEl.innerHTML = `
-      <div class="empty-state">
-        <span class="empty-emoji">🃏</span>
-        <p>Nenhum flashcard cadastrado ainda.</p>
-        <p>Clique em "Novo flashcard" para criar o primeiro.</p>
-      </div>`;
-    return;
+    on("btn-selecionar-flash", () => { flashSelecao = { assuntoId, ids: new Set() }; desenhar(); });
+    on("btn-sel-cancelar", () => { flashSelecao = null; desenhar(); });
+    on("btn-sel-todos", () => {
+      if (todosMarcados) flashSelecao.ids.clear();
+      else cards.forEach(c => flashSelecao.ids.add(c.id));
+      desenhar();
+    });
+    on("btn-excluir-sel", () => confirmDeleteFlashcardsEmLote(assuntoId, [...flashSelecao.ids]));
+    on("btn-exportar-sel", () => abrirModalExportarAnki({ assuntoId, flashIds: [...flashSelecao.ids] }));
+    on("btn-pdf-sel", () => abrirModalExportarPdf({ assuntoId, flashIds: [...flashSelecao.ids] }));
+
+    const listaEl = $("flash-lista");
+
+    if (cards.length === 0) {
+      listaEl.innerHTML = `
+        <div class="empty-state">
+          <span class="empty-emoji">🃏</span>
+          <p>Nenhum flashcard cadastrado ainda.</p>
+          <p>Clique em "Novo flashcard" para criar o primeiro ou em "Importar" para trazer vários de uma vez.</p>
+        </div>`;
+      return;
+    }
+
+    cards.forEach((f, i) => {
+      const rotulo = rotuloFlashcard(f);
+      const marcado = selecionando && flashSelecao.ids.has(f.id);
+      const row = document.createElement("div");
+      row.className = "flash-item" + (selecionando ? " selecionavel" : "") + (marcado ? " selecionado" : "");
+      row.innerHTML = `
+        ${selecionando ? `<input type="checkbox" class="flash-check" ${marcado ? "checked" : ""} aria-label="Selecionar flashcard ${i + 1}">` : ""}
+        <span class="assunto-index">${String(i + 1).padStart(2, "0")}</span>
+        <div class="flash-item-texto">
+          <div class="flash-item-frente">${escapeHTML(f.frente)}</div>
+          <div class="flash-item-verso">${escapeHTML(f.verso)}</div>
+        </div>
+        <div class="flash-item-lado">
+          <span class="flash-badge ${rotulo.classe}">${rotulo.texto}</span>
+          ${selecionando ? "" : `
+            <button class="btn-icon btn-edit-flash" title="Editar">✏️</button>
+            <button class="btn-icon btn-delete-flash" title="Excluir">🗑️</button>`}
+        </div>
+      `;
+
+      if (selecionando) {
+        row.addEventListener("click", (e) => {
+          e.preventDefault(); // evita o checkbox alternar sozinho e ficar fora de sincronia
+          if (flashSelecao.ids.has(f.id)) flashSelecao.ids.delete(f.id);
+          else flashSelecao.ids.add(f.id);
+          desenhar();
+        });
+      } else {
+        row.addEventListener("click", (e) => {
+          if (e.target.closest(".btn-icon")) return;
+          abrirModalFlashcard(assuntoId, f);
+        });
+        row.querySelector(".btn-edit-flash").addEventListener("click", () => abrirModalFlashcard(assuntoId, f));
+        row.querySelector(".btn-delete-flash").addEventListener("click", () => confirmDeleteFlashcard(f));
+      }
+      listaEl.appendChild(row);
+    });
+  };
+
+  desenhar();
+}
+
+/* ---------- importar flashcards (texto colado ou arquivo, ex.: gerados por IA) ---------- */
+
+function normalizarTextoCard(v) {
+  return String(v ?? "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/\r\n?/g, "\n")
+    .trim();
+}
+function chaveDuplicado(frente) {
+  return frente.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim();
+}
+
+// Aceita: JSON (lista de {frente, verso}), blocos "Frente: ... Verso: ..." ou linhas "frente ::: verso".
+function interpretarFlashcardsImportados(bruto) {
+  let t = String(bruto ?? "").replace(/^\uFEFF/, "").trim();
+  if (!t) return { cards: [], invalidos: 0, erro: null };
+  t = t.replace(/^```[a-zA-Z]*\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
+
+  const cards = [];
+  let invalidos = 0;
+  const addCard = (frente, verso) => {
+    frente = normalizarTextoCard(frente);
+    verso = normalizarTextoCard(verso);
+    if (frente && verso) cards.push({ frente, verso }); else invalidos++;
+  };
+
+  // ---- JSON ----
+  if (t[0] === "[" || t[0] === "{") {
+    let dados;
+    try { dados = JSON.parse(t); }
+    catch (e) {
+      const i = t.indexOf("["), j = t.lastIndexOf("]");
+      try { dados = JSON.parse(t.slice(i, j + 1)); }
+      catch (e2) { return { cards: [], invalidos: 0, erro: "O texto parece JSON, mas está com erro de formatação. Peça para a IA responder só com o JSON válido." }; }
+    }
+    if (!Array.isArray(dados)) {
+      dados = dados.flashcards || dados.cards || dados.cartoes || dados["cartões"] || dados.items || dados.data || [];
+    }
+    if (!Array.isArray(dados)) return { cards: [], invalidos: 0, erro: "Não encontrei uma lista de flashcards no JSON." };
+    const pega = (o, chaves) => {
+      for (const k of chaves) if (o[k] != null && String(o[k]).trim() !== "") return o[k];
+      return "";
+    };
+    dados.forEach(item => {
+      if (Array.isArray(item)) addCard(item[0], item[1]);
+      else if (item && typeof item === "object") {
+        addCard(
+          pega(item, ["frente", "Frente", "pergunta", "Pergunta", "front", "Front", "question", "q"]),
+          pega(item, ["verso", "Verso", "resposta", "Resposta", "back", "Back", "answer", "a"])
+        );
+      } else invalidos++;
+    });
+    return { cards, invalidos, erro: null };
   }
 
-  cards.forEach((f, i) => {
-    const rotulo = rotuloFlashcard(f);
-    const row = document.createElement("div");
-    row.className = "flash-item";
-    row.innerHTML = `
-      <span class="assunto-index">${String(i + 1).padStart(2, "0")}</span>
-      <div class="flash-item-texto">
-        <div class="flash-item-frente">${escapeHTML(f.frente)}</div>
-        <div class="flash-item-verso">${escapeHTML(f.verso)}</div>
-      </div>
-      <div class="flash-item-lado">
-        <span class="flash-badge ${rotulo.classe}">${rotulo.texto}</span>
-        <button class="btn-icon btn-edit-flash" title="Editar">✏️</button>
-        <button class="btn-icon btn-delete-flash" title="Excluir">🗑️</button>
-      </div>
-    `;
-    row.addEventListener("click", (e) => {
-      if (e.target.closest(".btn-icon")) return;
-      abrirModalFlashcard(assuntoId, f);
+  // ---- blocos com marcadores Frente:/Verso: (ou P:/R:, Pergunta:/Resposta:) ----
+  const reFrente = /^\s*(?:\d+[.)]\s*)?(?:frente|pergunta|front|question|p|q)\s*[:：]\s*(.*)$/i;
+  const reVerso = /^\s*(?:verso|resposta|back|answer|r|a)\s*[:：]\s*(.*)$/i;
+  const linhas = t.split("\n");
+  if (linhas.some(l => reFrente.test(l)) && linhas.some(l => reVerso.test(l))) {
+    let atual = null, campo = null;
+    const fecha = () => { if (atual) addCard(atual.frente, atual.verso); atual = null; };
+    for (const linha of linhas) {
+      let m;
+      if ((m = linha.match(reFrente))) { fecha(); atual = { frente: m[1], verso: "" }; campo = "frente"; }
+      else if ((m = linha.match(reVerso)) && atual) { atual.verso = m[1]; campo = "verso"; }
+      else if (/^\s*(-{3,}|\*{3,}|={3,})\s*$/.test(linha)) { fecha(); campo = null; }
+      else if (atual && campo) atual[campo] += "\n" + linha;
+    }
+    fecha();
+    return { cards, invalidos, erro: null };
+  }
+
+  // ---- uma linha por card: "frente ::: verso" ou separado por TAB ----
+  for (const linha of linhas) {
+    if (!linha.trim()) continue;
+    let partes = null;
+    if (linha.includes(":::")) partes = linha.split(":::");
+    else if (linha.includes("\t")) partes = linha.split("\t");
+    if (partes && partes.length >= 2) addCard(partes[0], partes.slice(1).join(" "));
+    else invalidos++;
+  }
+  return { cards, invalidos, erro: null };
+}
+
+async function copiarParaAreaDeTransferencia(texto) {
+  try { await navigator.clipboard.writeText(texto); return true; }
+  catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = texto; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (e2) {}
+    ta.remove();
+    return ok;
+  }
+}
+
+async function abrirModalImportarFlashcards(assuntoId) {
+  let tema = "[ESCREVA AQUI O ASSUNTO]";
+  try {
+    const a = await dbGet("assuntos", assuntoId);
+    if (a && a.nome) tema = a.nome;
+  } catch (e) {}
+
+  const prompt =
+`Crie flashcards de estudo para concurso sobre o tema: ${tema}.
+
+Responda SOMENTE com um array JSON válido, sem nenhum texto antes ou depois e sem bloco de código, exatamente neste formato:
+[
+  {"frente": "pergunta curta e objetiva", "verso": "resposta direta e completa"}
+]
+
+Regras:
+- Uma única ideia por card.
+- A frente deve ser uma pergunta ou uma frase com lacuna.
+- O verso deve ser objetivo e, quando houver, citar o artigo/lei (ex.: "Art. 5º, XI, CF/88").
+- Texto puro: sem markdown e sem HTML. Para quebra de linha dentro de um campo, use \\n.
+- Não repita cards.
+
+Gere 20 flashcards.`;
+
+  openModal(`
+    <h3 class="modal-title">Importar flashcards</h3>
+    <p class="import-flash-intro">Cole abaixo os flashcards gerados pela IA ou escolha um arquivo. Eles serão adicionados a este assunto.</p>
+    <div class="import-flash-acoes">
+      <button type="button" class="btn-secondary" id="btn-copiar-prompt">📋 Copiar prompt para a IA</button>
+      <button type="button" class="btn-secondary" id="btn-escolher-arquivo">📄 Escolher arquivo</button>
+      <input type="file" id="input-arquivo-flash" accept=".json,.txt,.csv,.tsv,.md,text/plain,application/json" hidden>
+    </div>
+    <div class="modal-field">
+      <label for="import-flash-texto">Conteúdo</label>
+      <textarea id="import-flash-texto" class="modal-input flash-textarea import-flash-textarea" spellcheck="false"
+        placeholder='[{"frente": "Pergunta?", "verso": "Resposta."}]&#10;&#10;ou&#10;&#10;Frente: Pergunta?&#10;Verso: Resposta.&#10;&#10;ou uma linha por card:&#10;Pergunta? ::: Resposta.'></textarea>
+    </div>
+    <label class="import-flash-check">
+      <input type="checkbox" id="import-flash-ignorar" checked> Pular cards que já existem neste assunto (mesma frente)
+    </label>
+    <div id="import-flash-preview" class="import-flash-preview"></div>
+    <div class="modal-actions">
+      <button class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
+      <button class="btn-primary" id="btn-confirmar-import" disabled>Importar</button>
+    </div>
+  `);
+  document.getElementById("modal-box").classList.add("modal-wide");
+
+  const existentes = await dbGetAll("flashcards", "assuntoId", assuntoId);
+  const chavesExistentes = new Set(existentes.map(f => chaveDuplicado(f.frente || "")));
+
+  const txt = document.getElementById("import-flash-texto");
+  const chk = document.getElementById("import-flash-ignorar");
+  const prev = document.getElementById("import-flash-preview");
+  const btnOk = document.getElementById("btn-confirmar-import");
+  let paraImportar = [];
+
+  function atualizar() {
+    const r = interpretarFlashcardsImportados(txt.value);
+    const vistos = new Set();
+    let duplicados = 0;
+    paraImportar = [];
+    r.cards.forEach(c => {
+      const k = chaveDuplicado(c.frente);
+      const dup = vistos.has(k) || (chk.checked && chavesExistentes.has(k));
+      vistos.add(k);
+      if (dup) duplicados++; else paraImportar.push(c);
     });
-    row.querySelector(".btn-edit-flash").addEventListener("click", () => abrirModalFlashcard(assuntoId, f));
-    row.querySelector(".btn-delete-flash").addEventListener("click", () => confirmDeleteFlashcard(f));
-    listaEl.appendChild(row);
+
+    if (!txt.value.trim()) {
+      prev.innerHTML = "";
+    } else if (r.erro) {
+      prev.innerHTML = `<p class="import-flash-erro">${escapeHTML(r.erro)}</p>`;
+    } else if (r.cards.length === 0) {
+      prev.innerHTML = `<p class="import-flash-erro">Não consegui reconhecer nenhum flashcard. Use JSON, blocos "Frente:/Verso:" ou "pergunta ::: resposta".</p>`;
+    } else {
+      const notas = [];
+      if (duplicados) notas.push(`${duplicados} repetido${duplicados === 1 ? "" : "s"} (pulado${duplicados === 1 ? "" : "s"})`);
+      if (r.invalidos) notas.push(`${r.invalidos} incompleto${r.invalidos === 1 ? "" : "s"} (sem frente ou verso)`);
+      const amostra = paraImportar.slice(0, 3).map(c => `
+        <div class="import-flash-amostra">
+          <b>${escapeHTML(c.frente.length > 140 ? c.frente.slice(0, 140) + "…" : c.frente)}</b>
+          <span>${escapeHTML(c.verso.length > 180 ? c.verso.slice(0, 180) + "…" : c.verso)}</span>
+        </div>`).join("");
+      prev.innerHTML = `
+        <p class="import-flash-ok"><b>${paraImportar.length}</b> flashcard${paraImportar.length === 1 ? "" : "s"} pronto${paraImportar.length === 1 ? "" : "s"} para importar${notas.length ? " · " + notas.join(" · ") : ""}</p>
+        ${amostra}
+        ${paraImportar.length > 3 ? `<p class="import-flash-mais">… e mais ${paraImportar.length - 3}</p>` : ""}`;
+    }
+    btnOk.disabled = paraImportar.length === 0;
+    btnOk.textContent = paraImportar.length ? `Importar ${paraImportar.length}` : "Importar";
+  }
+
+  txt.addEventListener("input", atualizar);
+  chk.addEventListener("change", atualizar);
+
+  document.getElementById("btn-copiar-prompt").addEventListener("click", async () => {
+    const ok = await copiarParaAreaDeTransferencia(prompt);
+    showToast(ok ? "Prompt copiado! Cole na IA 📋" : "Não consegui copiar o prompt.");
+  });
+
+  const inputArq = document.getElementById("input-arquivo-flash");
+  document.getElementById("btn-escolher-arquivo").addEventListener("click", () => inputArq.click());
+  inputArq.addEventListener("change", async () => {
+    const arq = inputArq.files && inputArq.files[0];
+    if (!arq) return;
+    txt.value = await arq.text();
+    inputArq.value = "";
+    atualizar();
+  });
+
+  document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
+  btnOk.addEventListener("click", async () => {
+    if (!paraImportar.length) return;
+    btnOk.disabled = true;
+    const base = Date.now();
+    for (let i = 0; i < paraImportar.length; i++) {
+      await dbPut("flashcards", {
+        assuntoId,
+        frente: paraImportar[i].frente,
+        verso: paraImportar[i].verso,
+        criadoEm: base + i,     // mantém a ordem do arquivo
+        caixa: 0,
+        proximaRevisao: 0,
+        revisoes: 0,
+        erros: 0,
+      });
+    }
+    const n = paraImportar.length;
+    closeModal();
+    showToast(`${n} flashcard${n === 1 ? "" : "s"} importado${n === 1 ? "" : "s"} ✅`);
+    renderFlashcardsTab(assuntoId);
   });
 }
 
@@ -1633,11 +2717,11 @@ function abrirModalFlashcard(assuntoId, flashcard = null) {
     <h3 class="modal-title">${editando ? "Editar flashcard" : "Novo flashcard"}</h3>
     <div class="modal-field">
       <label for="input-flash-frente">Frente (pergunta)</label>
-      <textarea id="input-flash-frente" class="modal-input flash-textarea" maxlength="1000" placeholder="Ex: Quando NÃO se usa crase?"></textarea>
+      <textarea id="input-flash-frente" class="modal-input flash-textarea" maxlength="3000" placeholder="Ex: Quando NÃO se usa crase?"></textarea>
     </div>
     <div class="modal-field">
       <label for="input-flash-verso">Verso (resposta)</label>
-      <textarea id="input-flash-verso" class="modal-input flash-textarea" maxlength="2000" placeholder="Ex: Antes de palavras masculinas, verbos, pronomes pessoais..."></textarea>
+      <textarea id="input-flash-verso" class="modal-input flash-textarea" maxlength="8000" placeholder="Ex: Antes de palavras masculinas, verbos, pronomes pessoais..."></textarea>
     </div>
     <div class="modal-actions">
       <button class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
@@ -1649,10 +2733,16 @@ function abrirModalFlashcard(assuntoId, flashcard = null) {
 
   const inFrente = document.getElementById("input-flash-frente");
   const inVerso = document.getElementById("input-flash-verso");
+  // janela larga + caixas que crescem conforme o texto (sem rolar dentro da caixa)
+  document.getElementById("modal-box").classList.add("modal-wide", "modal-editor");
+  const ajustar = () => { autoAjustarTextarea(inFrente); autoAjustarTextarea(inVerso); };
+  [inFrente, inVerso].forEach(el => el.addEventListener("input", ajustar));
   if (editando) {
     inFrente.value = flashcard.frente;
     inVerso.value = flashcard.verso;
   }
+  ajustar();
+  requestAnimationFrame(ajustar);
 
   const salvar = async (continuar) => {
     const frente = inFrente.value.trim();
@@ -1681,6 +2771,7 @@ function abrirModalFlashcard(assuntoId, flashcard = null) {
     if (continuar) {
       inFrente.value = "";
       inVerso.value = "";
+      ajustar();
       inFrente.focus();
     } else {
       closeModal();
@@ -1720,6 +2811,31 @@ function confirmDeleteFlashcard(flashcard) {
     closeModal();
     showToast("Flashcard excluído.");
     renderFlashcardsTab(flashcard.assuntoId);
+  });
+}
+
+function confirmDeleteFlashcardsEmLote(assuntoId, ids) {
+  if (!ids.length) return;
+  const n = ids.length;
+  openModal(`
+    <h3 class="modal-title">Excluir ${n} flashcard${n === 1 ? "" : "s"}?</h3>
+    <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 4px;">
+      ${n === 1 ? "O flashcard selecionado será excluído" : `Os ${n} flashcards selecionados serão excluídos`}.
+      Essa ação não pode ser desfeita.
+    </p>
+    <div class="modal-actions">
+      <button class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
+      <button class="btn-danger" id="btn-confirm-delete">Excluir ${n}</button>
+    </div>
+  `);
+  document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
+  document.getElementById("btn-confirm-delete").addEventListener("click", async (e) => {
+    e.currentTarget.disabled = true;
+    for (const id of ids) await dbDelete("flashcards", id);
+    flashSelecao = null;
+    closeModal();
+    showToast(`${n} flashcard${n === 1 ? "" : "s"} excluído${n === 1 ? "" : "s"}.`);
+    renderFlashcardsTab(assuntoId);
   });
 }
 
@@ -1847,6 +2963,13 @@ async function avaliarFlashcard(nota) {
     const { caixa, dias } = calcularProximaRevisao(f.caixa ?? 0, nota);
     f.caixa = caixa;
     f.proximaRevisao = inicioDoDia(dias);
+    // histórico de revisões (alimenta o painel de desempenho). Cartões antigos, que só
+    // tinham "ultimaRevisao", ganham uma entrada inicial sem nota.
+    if (!Array.isArray(f.historico)) {
+      f.historico = [];
+      if (typeof f.ultimaRevisao === "number") f.historico.push({ em: f.ultimaRevisao, nota: null });
+    }
+    f.historico.push({ em: Date.now(), nota });
     f.ultimaRevisao = Date.now();
     f.revisoes = (f.revisoes ?? 0) + 1;
     if (nota === "errei") f.erros = (f.erros ?? 0) + 1;
@@ -1963,10 +3086,9 @@ async function runSearch(termo) {
 
   const termoLower = termo.toLowerCase();
 
-  const [todosAssuntos, todasQuestoes, todasAnotacoes] = await Promise.all([
+  const [todosAssuntos, todasQuestoes] = await Promise.all([
     dbGetAll("assuntos"),
     dbGetAll("questoes"),
-    dbGetAll("anotacoes"),
   ]);
 
   const mapaAssuntos = new Map(todosAssuntos.map(a => [a.id, a]));
@@ -1978,11 +3100,7 @@ async function runSearch(termo) {
     (q.comentario && q.comentario.toLowerCase().includes(termoLower))
   );
 
-  const anotacoesMatch = todasAnotacoes.filter(n =>
-    n.texto && n.texto.toLowerCase().includes(termoLower)
-  );
-
-  const totalResultados = assuntosMatch.length + questoesMatch.length + anotacoesMatch.length;
+  const totalResultados = assuntosMatch.length + questoesMatch.length;
 
   if (totalResultados === 0) {
     container.innerHTML = `
@@ -2030,31 +3148,10 @@ async function runSearch(termo) {
           const ordenadas = await getQuestoesOrdenadas(assunto.id);
           const idx = ordenadas.findIndex(q => q.id === questao.id);
           state.currentPagina = idx >= 0 ? Math.ceil((idx + 1) / QUESTOES_POR_PAGINA) : 1;
-          state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos" };
+          state.filtros = { status: "todos", dificuldade: "todos", favorito: false, desempenho: "todos", respondidas: "todos" };
           document.getElementById("search-input").value = "";
           await goToAssunto(assunto.id);
           setActiveTab("questoes");
-        },
-      });
-    })));
-  }
-
-  // --- anotações ---
-  if (anotacoesMatch.length > 0) {
-    container.appendChild(criarGrupoBusca("📝 Anotações", anotacoesMatch.map(anotacao => {
-      const assunto = mapaAssuntos.get(anotacao.assuntoId);
-      const materia = assunto ? getMateriaById(assunto.materiaId) : null;
-      return criarLinhaBusca({
-        icone: "📝",
-        titulo: assunto ? assunto.nome : "Anotação",
-        meta: (materia ? rotuloMateria(materia) + " · " : "") + trechoDestaque(anotacao.texto, termoLower),
-        onClick: async () => {
-          if (!assunto) return;
-          ativarConcursoDaMateria(assunto.materiaId);
-          state.currentMateriaId = assunto.materiaId;
-          document.getElementById("search-input").value = "";
-          await goToAssunto(assunto.id);
-          setActiveTab("anotacoes");
         },
       });
     })));
@@ -2140,8 +3237,6 @@ async function getProgressoPorMateria() {
 async function renderRoteiro() {
   const progresso = await getProgressoPorMateria();
   renderRoteiroResumo(progresso);
-  await renderSugestaoDoDia(progresso);
-  await renderCronogramaGrid();
   renderChecklist(progresso);
 }
 
@@ -2187,144 +3282,8 @@ function renderRoteiroResumo(progresso) {
         <div class="progresso-revisao-barra" style="width:${pctGeral}%; background:var(--accent);"></div>
       </div>
     </div>
-    <div class="resumo-materias-grid">
-      ${MATERIAS.map(m => `
-        <div class="resumo-materia-item" style="--card-color:${m.cor};">
-          <div class="resumo-materia-topo">
-            <span>${m.icone} ${escapeHTML(m.nome)}</span>
-            <span class="resumo-materia-pct">${progresso[m.id].feitos}/${progresso[m.id].total}</span>
-          </div>
-          <div class="progresso-revisao">
-            <div class="progresso-revisao-barra" style="width:${progresso[m.id].pct}%;"></div>
-          </div>
-        </div>
-      `).join("")}
-    </div>
   `;
 }
-
-async function renderSugestaoDoDia(progresso) {
-  const hoje = new Date().getDay(); // 0 = Domingo ... 6 = Sábado
-  const cronogramaHoje = await dbGet("cronograma", hoje).catch(() => null);
-  const el = document.getElementById("roteiro-sugestao");
-
-  let materiasAlvo = [];
-  if (cronogramaHoje && cronogramaHoje.materiaIds) {
-    // só as matérias deste roteiro (o cronograma guarda ids de todos os roteiros)
-    materiasAlvo = cronogramaHoje.materiaIds
-      .map(id => MATERIAS.find(m => m.id === id))
-      .filter(Boolean);
-  }
-  const temCronogramaHoje = materiasAlvo.length > 0;
-
-  if (!temCronogramaHoje) {
-    // sem cronograma definido para hoje: sugere as matérias com menor % de conclusão
-    materiasAlvo = [...MATERIAS]
-      .filter(m => progresso[m.id].pct < 100)
-      .sort((a, b) => progresso[a.id].pct - progresso[b.id].pct)
-      .slice(0, 2);
-  }
-
-  if (materiasAlvo.length === 0) {
-    el.innerHTML = `
-      <div class="empty-state">
-        <span class="empty-emoji">🎉</span>
-        <p>Todos os tópicos cadastrados no checklist já foram concluídos.</p>
-      </div>`;
-    return;
-  }
-
-  el.innerHTML = `
-    <div class="sugestao-dia-label">
-      ${temCronogramaHoje ? "Hoje é dia de estudar:" : "Sem cronograma definido para hoje — sugestão automática (menor progresso):"}
-      <b>${DIAS_SEMANA[hoje]}</b>
-    </div>
-    <div class="sugestao-cards">
-      ${materiasAlvo.map(m => {
-        const prog = progresso[m.id];
-        const proximo = prog.topicos.find(t => !t.concluido);
-        return `
-          <div class="sugestao-card" style="--card-color:${m.cor};" data-materia="${m.id}">
-            <div class="sugestao-card-topo">${m.icone} <b>${escapeHTML(m.nome)}</b></div>
-            <div class="sugestao-card-topico">${proximo ? "Próximo tópico: " + escapeHTML(proximo.nome) : (prog.total === 0 ? "Nenhum tópico cadastrado ainda." : "Todos os tópicos concluídos!")}</div>
-            <span class="sugestao-card-pct">${prog.pct}% concluído</span>
-          </div>
-        `;
-      }).join("")}
-    </div>
-  `;
-
-  el.querySelectorAll(".sugestao-card").forEach(card => {
-    card.addEventListener("click", () => goToMateria(card.dataset.materia));
-  });
-}
-
-async function renderCronogramaGrid() {
-  const grid = document.getElementById("cronograma-grid");
-  const cronogramaTodos = await dbGetAll("cronograma");
-  const mapaCronograma = {};
-  cronogramaTodos.forEach(c => { mapaCronograma[c.dia] = c.materiaIds || []; });
-
-  const hoje = new Date().getDay();
-
-  grid.innerHTML = DIAS_SEMANA.map((nomeDia, dia) => {
-    const selecionadas = mapaCronograma[dia] || [];
-    return `
-      <div class="cronograma-linha ${dia === hoje ? "cronograma-linha-hoje" : ""}">
-        <span class="cronograma-dia-label">${nomeDia}</span>
-        <div class="cronograma-chips" data-dia="${dia}">
-          ${MATERIAS.map(m => `
-            <button type="button" class="cronograma-chip ${selecionadas.includes(m.id) ? "active" : ""}"
-              data-materia="${m.id}" style="--chip-color:${m.cor};">
-              ${m.icone} ${escapeHTML(m.curto || m.nome.split(" ")[0])}
-            </button>
-          `).join("")}
-        </div>
-      </div>
-    `;
-  }).join("");
-
-  grid.querySelectorAll(".cronograma-chip").forEach(chip => {
-    chip.addEventListener("click", async () => {
-      const linha = chip.closest(".cronograma-chips");
-      const dia = Number(linha.dataset.dia);
-      const materiaId = chip.dataset.materia;
-      const atual = mapaCronograma[dia] || [];
-      const novo = atual.includes(materiaId) ? atual.filter(id => id !== materiaId) : [...atual, materiaId];
-      mapaCronograma[dia] = novo;
-      chip.classList.toggle("active");
-      await dbPut("cronograma", { dia, materiaIds: novo });
-      const progresso = await getProgressoPorMateria();
-      renderSugestaoDoDia(progresso);
-    });
-  });
-}
-
-document.getElementById("btn-limpar-cronograma").addEventListener("click", () => {
-  openModal(`
-    <h3 class="modal-title">Limpar cronograma semanal?</h3>
-    <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 4px;">
-      Isso vai remover as matérias atribuídas aos dias da semana <b>neste roteiro</b> (os outros roteiros não são afetados). Essa ação não pode ser desfeita.
-    </p>
-    <div class="modal-actions">
-      <button class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
-      <button class="btn-danger" id="btn-confirm-limpar-cronograma">Limpar</button>
-    </div>
-  `);
-  document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
-  document.getElementById("btn-confirm-limpar-cronograma").addEventListener("click", async () => {
-    const idsAtuais = new Set(MATERIAS.map(m => m.id));
-    const todosDias = await dbGetAll("cronograma");
-    for (const dia of todosDias) {
-      const restante = (dia.materiaIds || []).filter(id => !idsAtuais.has(id));
-      if (restante.length > 0) await dbPut("cronograma", { ...dia, materiaIds: restante });
-      else await dbDelete("cronograma", dia.dia);
-    }
-    closeModal();
-    showToast("Cronograma limpo.");
-    renderRoteiro();
-  });
-});
 
 function renderChecklist(progresso) {
   const container = document.getElementById("checklist-container");
@@ -2454,58 +3413,93 @@ function dbClear(storeName) {
   });
 }
 
-async function gerarBackupJSON() {
-  const assuntos = await dbGetAll("assuntos");
-  const materiaisRaw = await dbGetAll("materiais");
-  const questoesRaw = await dbGetAll("questoes");
-  const anotacoes = await dbGetAll("anotacoes");
-  const flashcards = await dbGetAll("flashcards");
-  const concursos = await dbGetAll("concursos");
-  const topicos = await dbGetAll("topicos");
-  const cronograma = await dbGetAll("cronograma");
-
-  const materiais = [];
-  for (const m of materiaisRaw) {
-    materiais.push({
-      ...m,
-      arquivo: m.arquivo ? await blobToBase64(m.arquivo) : null,
-    });
-  }
-
-  const questoes = [];
-  for (const q of questoesRaw) {
-    questoes.push({
-      ...q,
-      imagem: q.imagem ? await blobToBase64(q.imagem) : null,
-    });
-  }
-
+async function lerDadosBackupBruto() {
   return {
-    app: "caderno-estudos-concursos",
-    versao: 2,
-    exportadoEm: new Date().toISOString(),
-    dados: { assuntos, materiais, questoes, anotacoes, flashcards, concursos, topicos, cronograma },
+    assuntos: await dbGetAll("assuntos"),
+    materiais: await dbGetAll("materiais"),
+    questoes: await dbGetAll("questoes"),
+    anotacoes: await dbGetAll("anotacoes"),
+    flashcards: await dbGetAll("flashcards"),
+    concursos: await dbGetAll("concursos"),
+    topicos: await dbGetAll("topicos"),
+    cronograma: await dbGetAll("cronograma"),
   };
+}
+
+// Formato principal (v3): arquivo .zip com o backup.json (só texto/dados) + cada PDF e cada
+// imagem como arquivo separado. Assim nada vira uma string gigante (o JSON único estourava o
+// limite do navegador, ~512 MB, quando havia muitos PDFs/imagens) e o backup fica ~30% menor.
+async function gerarBackupZip() {
+  const d = await lerDadosBackupBruto();
+  const zip = new JSZip();
+
+  const separar = (lista, campo, pasta) => lista.map(item => {
+    const { [campo]: blob, ...resto } = item;
+    if (!blob) return { ...resto, [campo]: null };
+    const caminho = `arquivos/${pasta}/${item.id}`;
+    zip.file(caminho, blob, { compression: "STORE" }); // PDFs e imagens já são comprimidos
+    return { ...resto, [campo + "Ref"]: caminho, [campo + "Tipo"]: blob.type || "" };
+  });
+
+  const materiais = separar(d.materiais, "arquivo", "materiais");
+  const questoes = separar(d.questoes, "imagem", "questoes");
+
+  const backup = {
+    app: "caderno-estudos-concursos",
+    versao: 3,
+    exportadoEm: new Date().toISOString(),
+    dados: { assuntos: d.assuntos, materiais, questoes, anotacoes: d.anotacoes, flashcards: d.flashcards, concursos: d.concursos, topicos: d.topicos, cronograma: d.cronograma },
+  };
+  zip.file("backup.json", JSON.stringify(backup), { compression: "DEFLATE" });
+  return zip.generateAsync({ type: "blob", streamFiles: true });
+}
+
+// Reserva (sem internet para carregar o JSZip): .json montado em pedaços, sem criar uma única
+// string gigante. Para backups muito grandes prefira o .zip.
+async function gerarBackupJsonBlob() {
+  const d = await lerDadosBackupBruto();
+  const partes = [`{"app":"caderno-estudos-concursos","versao":2,"exportadoEm":${JSON.stringify(new Date().toISOString())},"dados":{`];
+  const comArquivos = async (lista, campo) => {
+    partes.push("[");
+    for (let i = 0; i < lista.length; i++) {
+      const { [campo]: blob, ...resto } = lista[i];
+      const base = JSON.stringify(resto).slice(0, -1); // tira a "}" final
+      partes.push((i ? "," : "") + base + `,${JSON.stringify(campo)}:`);
+      partes.push(blob ? JSON.stringify(await blobToBase64(blob)) : "null");
+      partes.push("}");
+    }
+    partes.push("]");
+  };
+  const simples = ["assuntos", "anotacoes", "flashcards", "concursos", "topicos", "cronograma"];
+  partes.push(simples.map(k => `${JSON.stringify(k)}:${JSON.stringify(d[k])}`).join(",") + ",");
+  partes.push('"materiais":'); await comArquivos(d.materiais, "arquivo");
+  partes.push(',"questoes":'); await comArquivos(d.questoes, "imagem");
+  partes.push("}}");
+  return new Blob(partes, { type: "application/json" });
 }
 
 async function exportarBackup() {
   showToast("Gerando backup...");
   try {
-    const backup = await gerarBackupJSON();
-    const jsonStr = JSON.stringify(backup, null, 2);
-    const blob = new Blob([jsonStr], { type: "application/json" });
+    let usarZip = true;
+    try {
+      if (!window.JSZip) await carregarScriptExterno(ANKI_JSZIP_URL);
+    } catch (e) {
+      usarZip = false; // sem internet e a biblioteca ainda não está no cache
+    }
+    const blob = usarZip ? await gerarBackupZip() : await gerarBackupJsonBlob();
     const url = URL.createObjectURL(blob);
 
     const dataFormatada = new Date().toISOString().slice(0, 10);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `backup-caderno-estudos-${dataFormatada}.json`;
+    a.download = `backup-caderno-estudos-${dataFormatada}.${usarZip ? "zip" : "json"}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
 
-    showToast("Backup exportado com sucesso.");
+    showToast(usarZip ? "Backup exportado com sucesso." : "Backup exportado (.json, pois a biblioteca de .zip não carregou).");
   } catch (err) {
     console.error("Erro ao exportar backup:", err);
     showToast("Erro ao gerar o backup.");
@@ -2525,8 +3519,17 @@ document.getElementById("import-file-input").addEventListener("change", async (e
 
   let backup;
   try {
-    const texto = await file.text();
-    backup = JSON.parse(texto);
+    if (/\.zip$/i.test(file.name)) {
+      if (!window.JSZip) await carregarScriptExterno(ANKI_JSZIP_URL);
+      const zip = await JSZip.loadAsync(file);
+      const entrada = zip.file("backup.json");
+      if (!entrada) throw new Error("backup.json não encontrado no .zip");
+      backup = JSON.parse(await entrada.async("string"));
+      backup._zip = zip; // os PDFs e imagens são lidos daqui na hora de restaurar
+    } else {
+      const texto = await file.text();
+      backup = JSON.parse(texto);
+    }
   } catch (err) {
     showToast("Arquivo de backup inválido.");
     return;
@@ -2545,8 +3548,8 @@ function confirmarImportacao(backup) {
   openModal(`
     <h3 class="modal-title">Importar backup?</h3>
     <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 10px;">
-      Esse arquivo contém <b>${assuntos.length}</b> assunto(s), <b>${materiais.length}</b> PDF(s),
-      <b>${questoes.length}</b> questão(ões), <b>${anotacoes.length}</b> anotação(ões) e <b>${flashcards.length}</b> flashcard(s).
+      Esse arquivo contém <b>${assuntos.length}</b> assunto(s), <b>${materiais.length}</b> material(is),
+      <b>${questoes.length}</b> questão(ões) e <b>${flashcards.length}</b> flashcard(s).
     </p>
     <p style="font-size:13.5px; color:var(--danger); margin:0 0 4px;">
       ⚠️ Isso vai <b>substituir todos os dados atuais</b> do aplicativo. Essa ação não pode ser desfeita.
@@ -2561,6 +3564,19 @@ function confirmarImportacao(backup) {
     closeModal();
     await importarBackup(backup);
   });
+}
+
+// devolve o Blob de um PDF/imagem do backup: do .zip (v3) ou do base64 dentro do .json (v1/v2)
+async function blobDoBackup(backup, item, campo) {
+  const ref = item[campo + "Ref"];
+  if (ref && backup._zip) {
+    const f = backup._zip.file(ref);
+    if (!f) return null;
+    const blob = await f.async("blob");
+    const tipo = item[campo + "Tipo"];
+    return tipo ? blob.slice(0, blob.size, tipo) : blob;
+  }
+  return item[campo] ? base64ToBlob(item[campo]) : null;
 }
 
 async function importarBackup(backup) {
@@ -2578,16 +3594,12 @@ async function importarBackup(backup) {
       await dbPut("assuntos", a);
     }
     for (const m of materiais) {
-      await dbPut("materiais", {
-        ...m,
-        arquivo: m.arquivo ? await base64ToBlob(m.arquivo) : null,
-      });
+      const { arquivoRef, arquivoTipo, ...resto } = m;
+      await dbPut("materiais", { ...resto, arquivo: await blobDoBackup(backup, m, "arquivo") });
     }
     for (const q of questoes) {
-      await dbPut("questoes", {
-        ...q,
-        imagem: q.imagem ? await base64ToBlob(q.imagem) : null,
-      });
+      const { imagemRef, imagemTipo, ...resto } = q;
+      await dbPut("questoes", { ...resto, imagem: await blobDoBackup(backup, q, "imagem") });
     }
     for (const n of anotacoes) {
       await dbPut("anotacoes", n);
@@ -2835,7 +3847,7 @@ function ankiExtensaoImagem(tipo) {
   return "jpg";
 }
 
-async function coletarNotasAnki({ somenteConcursoAtual, incluirFlash, incluirQuestoes, subbaralhos }) {
+async function coletarNotasAnki({ somenteConcursoAtual, incluirFlash, incluirQuestoes, subbaralhos, assuntoId = null, flashIds = null }) {
   const assuntos = await dbGetAll("assuntos");
   const notas = [];
   const resumo = { flashcards: 0, questoes: 0, questoesSemConteudo: 0 };
@@ -2843,10 +3855,11 @@ async function coletarNotasAnki({ somenteConcursoAtual, incluirFlash, incluirQue
   assuntos.sort((a, b) => (a.ordem ?? 0) - (b.ordem ?? 0));
 
   for (const assunto of assuntos) {
+    if (assuntoId !== null && assunto.id !== assuntoId) continue; // exportação de um assunto só
     const materia = getMateriaById(assunto.materiaId);
     const concurso = concursoDaMateria(assunto.materiaId);
     if (!materia || !concurso) continue; // assunto órfão (matéria apagada)
-    if (somenteConcursoAtual && concurso.id !== state.currentConcursoId) continue;
+    if (assuntoId === null && somenteConcursoAtual && concurso.id !== state.currentConcursoId) continue;
 
     let baralho = (CONCURSOS.length > 1 ? concurso.nome + "::" : "") + materia.nome.replace(/::/g, ":");
     if (subbaralhos) baralho += "::" + assunto.nome.replace(/::/g, ":");
@@ -2857,6 +3870,7 @@ async function coletarNotasAnki({ somenteConcursoAtual, incluirFlash, incluirQue
       cards.sort((a, b) => (a.criadoEm ?? 0) - (b.criadoEm ?? 0));
       for (const f of cards) {
         if (!f.frente || !f.verso) continue;
+        if (flashIds && !flashIds.includes(f.id)) continue; // só os selecionados
         notas.push({
           modelo: "flash", baralho,
           frente: ankiTextoParaHtml(f.frente),
@@ -2934,11 +3948,15 @@ async function carregarBibliotecasAnki() {
   return ankiSQLCache;
 }
 
-function abrirModalExportarAnki() {
+function abrirModalExportarAnki(opts = {}) {
+  const assuntoId = opts.assuntoId ?? null;       // se vier, exporta só esse assunto
+  const flashIds = opts.flashIds ?? null;         // se vier, exporta só esses flashcards
+  const modoAssunto = assuntoId !== null;
   const concursoAtual = getConcursoAtual();
-  const temVarios = CONCURSOS.length > 1;
+  const temVarios = CONCURSOS.length > 1 && !modoAssunto;
   openModal(`
-    <h3 class="modal-title">Exportar para o Anki</h3>
+    <h3 class="modal-title">${flashIds ? `Exportar ${flashIds.length} flashcard${flashIds.length === 1 ? "" : "s"} selecionado${flashIds.length === 1 ? "" : "s"}`
+      : modoAssunto ? "Exportar este assunto para o Anki" : "Exportar tudo para o Anki"}</h3>
     <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 14px;">
       Gera um arquivo <b>.apkg</b>. No Anki, use <b>Arquivo → Importar</b> e escolha o arquivo.
       Cada matéria vira um baralho e cada assunto vira uma tag.
@@ -2946,19 +3964,21 @@ function abrirModalExportarAnki() {
 
     <div class="modal-field">
       <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
-        <input type="checkbox" id="anki-flash" checked> 🃏 Flashcards (frente / verso)
+        <input type="checkbox" id="anki-flash" checked ${flashIds ? "disabled" : ""}> 🃏 Flashcards (frente / verso)
       </label>
     </div>
+    ${flashIds ? `<input type="checkbox" id="anki-questoes" hidden>` : `
     <div class="modal-field">
       <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
-        <input type="checkbox" id="anki-questoes" checked> ❓ Questões (imagem na frente, resposta e comentários no verso)
+        <input type="checkbox" id="anki-questoes" ${modoAssunto ? "" : "checked"}> ❓ Questões (imagem na frente, resposta e comentários no verso)
       </label>
-    </div>
+    </div>`}
+    ${modoAssunto ? `<input type="checkbox" id="anki-sub" hidden>` : `
     <div class="modal-field">
       <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
         <input type="checkbox" id="anki-sub"> Separar cada assunto em um sub-baralho
       </label>
-    </div>
+    </div>`}
     ${temVarios ? `
     <div class="modal-field">
       <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
@@ -2994,7 +4014,7 @@ function abrirModalExportarAnki() {
     status.textContent = "Montando os cartões...";
 
     try {
-      const { notas, resumo } = await coletarNotasAnki({ somenteConcursoAtual, incluirFlash, incluirQuestoes, subbaralhos });
+      const { notas, resumo } = await coletarNotasAnki({ somenteConcursoAtual, incluirFlash, incluirQuestoes, subbaralhos, assuntoId, flashIds });
       if (notas.length === 0) {
         status.textContent = "Não encontrei nada para exportar com essas opções.";
         btn.disabled = false;
@@ -3018,7 +4038,15 @@ function abrirModalExportarAnki() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `caderno-estudos-anki-${new Date().toISOString().slice(0, 10)}.apkg`;
+      let sufixo = "";
+      if (modoAssunto) {
+        const ass = await dbGet("assuntos", assuntoId);
+        const slug = ((ass && ass.nome) || "assunto")
+          .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+          .replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 40);
+        sufixo = "-" + (slug || "assunto");
+      }
+      a.download = `caderno-estudos-anki${sufixo}-${new Date().toISOString().slice(0, 10)}.apkg`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -3036,7 +4064,517 @@ function abrirModalExportarAnki() {
   });
 }
 
-document.getElementById("btn-anki").addEventListener("click", abrirModalExportarAnki);
+document.getElementById("btn-anki").addEventListener("click", () => abrirModalExportarAnki());
+
+/* ============================================================
+   11A-2. EXPORTAR FLASHCARDS PARA PDF (por assunto)
+          Dois formatos: lista para estudar e cartões para imprimir.
+          A biblioteca jsPDF só é baixada na primeira exportação
+          (depois o service worker a mantém no cache).
+   ============================================================ */
+
+const PDF_JSPDF_URL = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js";
+const PDF_COR_DESTAQUE = [124, 92, 252]; // #7C5CFC
+
+async function carregarJsPDF() {
+  if (!window.jspdf) await carregarScriptExterno(PDF_JSPDF_URL);
+  return window.jspdf.jsPDF;
+}
+
+// As fontes padrão do PDF suportam acentos do português (Latin-1), mas não emojis
+// nem símbolos especiais: troca os mais comuns e remove o que não for suportado.
+function pdfLimparTexto(s) {
+  return String(s ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[→⇒➜➔➡]/g, "->").replace(/[←⇐]/g, "<-")
+    .replace(/≥/g, ">=").replace(/≤/g, "<=").replace(/≠/g, "!=")
+    .replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2013\u2014]/g, "-").replace(/\u2026/g, "...").replace(/[\u2022\u25CF]/g, "-")
+    .replace(/\t/g, "  ")
+    .replace(/[^\n\u0020-\u007E\u00A0-\u00FF]/g, "")
+    .trim();
+}
+
+function pdfSlug(txt) {
+  return (txt || "assunto")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase().slice(0, 40) || "assunto";
+}
+
+/* ---------- formato 1: lista (número, frente em negrito, verso embaixo) ---------- */
+function pdfMontarLista(doc, cards, titulo, subtitulo) {
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const M = 16, recuo = 10, larg = W - 2 * M - recuo;
+  let y = M;
+
+  const novaPagina = () => { doc.addPage(); y = M; };
+  const garantir = (altura) => { if (y + altura > H - M) novaPagina(); };
+
+  doc.setFont("helvetica", "bold").setFontSize(17).setTextColor(30);
+  const linhasTitulo = doc.splitTextToSize(titulo, W - 2 * M);
+  doc.text(linhasTitulo, M, y + 5);
+  y += linhasTitulo.length * 7 + 2;
+  doc.setFont("helvetica", "normal").setFontSize(9.5).setTextColor(130);
+  doc.text(subtitulo, M, y + 3);
+  y += 7;
+  doc.setDrawColor(...PDF_COR_DESTAQUE).setLineWidth(0.6).line(M, y, W - M, y);
+  y += 8;
+
+  const LH_FRENTE = 5.4, LH_VERSO = 5;
+  cards.forEach((f, i) => {
+    const frente = doc.setFont("helvetica", "bold").setFontSize(11.5) && doc.splitTextToSize(pdfLimparTexto(f.frente) || "-", larg);
+    const verso = doc.setFont("helvetica", "normal").setFontSize(10.5) && doc.splitTextToSize(pdfLimparTexto(f.verso) || "-", larg);
+    const total = frente.length * LH_FRENTE + 2 + verso.length * LH_VERSO + 9;
+    // se o cartão cabe numa página, não deixa ele ser cortado ao meio
+    if (total <= H - 2 * M) garantir(total);
+
+    const numero = String(i + 1).padStart(2, "0");
+    let primeiraLinha = true;
+    frente.forEach((ln) => {
+      garantir(LH_FRENTE);
+      if (primeiraLinha) {
+        doc.setFont("helvetica", "bold").setFontSize(10).setTextColor(...PDF_COR_DESTAQUE);
+        doc.text(numero, M, y + 4);
+        primeiraLinha = false;
+      }
+      doc.setFont("helvetica", "bold").setFontSize(11.5).setTextColor(25);
+      doc.text(ln, M + recuo, y + 4);
+      y += LH_FRENTE;
+    });
+    y += 2;
+    verso.forEach((ln) => {
+      garantir(LH_VERSO);
+      doc.setFont("helvetica", "normal").setFontSize(10.5).setTextColor(75);
+      doc.text(ln, M + recuo, y + 4);
+      y += LH_VERSO;
+    });
+    y += 4;
+    if (i < cards.length - 1) {
+      garantir(6);
+      doc.setDrawColor(225).setLineWidth(0.2).line(M + recuo, y, W - M, y);
+      y += 5;
+    }
+  });
+}
+
+/* ---------- formato 2: cartões para imprimir (frente/verso em páginas espelhadas) ---------- */
+function pdfDesenharCelula(doc, x, y, w, h, texto, rotulo, numero, ehVerso) {
+  doc.setDrawColor(170).setLineWidth(0.25).setLineDashPattern([2, 2], 0);
+  doc.rect(x, y, w, h);
+  doc.setLineDashPattern([], 0);
+
+  doc.setFont("helvetica", "bold").setFontSize(7.5).setTextColor(...PDF_COR_DESTAQUE);
+  doc.text(`${rotulo} ${numero}`, x + 4, y + 5.5);
+
+  const areaW = w - 12, areaH = h - 16;
+  let tam = 14, linhas = [], altLinha = 0;
+  for (; tam >= 7; tam -= 0.5) {
+    doc.setFont("helvetica", ehVerso ? "normal" : "bold").setFontSize(tam);
+    linhas = doc.splitTextToSize(texto || "-", areaW);
+    altLinha = tam * 0.3528 * 1.25;
+    if (linhas.length * altLinha <= areaH) break;
+  }
+  const maxLinhas = Math.max(1, Math.floor(areaH / altLinha));
+  if (linhas.length > maxLinhas) {
+    linhas = linhas.slice(0, maxLinhas);
+    linhas[maxLinhas - 1] = linhas[maxLinhas - 1].replace(/\s*\S{0,3}$/, "") + "...";
+  }
+  doc.setTextColor(ehVerso ? 60 : 20);
+  doc.setLineHeightFactor(1.25);
+  const topo = y + 9 + (areaH - linhas.length * altLinha) / 2;
+  doc.text(linhas, x + w / 2, topo, { align: "center", baseline: "top" });
+}
+
+function pdfMontarCartoes(doc, cards) {
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const M = 10, COLS = 2, LINS = 4;
+  const cw = (W - 2 * M) / COLS, ch = (H - 2 * M) / LINS;
+  const porPagina = COLS * LINS;
+  let primeira = true;
+
+  for (let ini = 0; ini < cards.length; ini += porPagina) {
+    const grupo = cards.slice(ini, ini + porPagina);
+    // página das frentes
+    if (!primeira) doc.addPage();
+    primeira = false;
+    grupo.forEach((f, k) => {
+      const col = k % COLS, lin = Math.floor(k / COLS);
+      pdfDesenharCelula(doc, M + col * cw, M + lin * ch, cw, ch, pdfLimparTexto(f.frente), "FRENTE", ini + k + 1, false);
+    });
+    // página dos versos (colunas espelhadas: alinha ao imprimir frente e verso na borda longa)
+    doc.addPage();
+    grupo.forEach((f, k) => {
+      const col = (COLS - 1) - (k % COLS), lin = Math.floor(k / COLS);
+      pdfDesenharCelula(doc, M + col * cw, M + lin * ch, cw, ch, pdfLimparTexto(f.verso), "VERSO", ini + k + 1, true);
+    });
+  }
+}
+
+async function gerarPdfFlashcards({ assuntoId, flashIds, formato }) {
+  const JsPDF = await carregarJsPDF();
+  const assunto = await dbGet("assuntos", assuntoId);
+  const materia = assunto ? getMateriaById(assunto.materiaId) : null;
+  let cards = await getFlashcardsOrdenados(assuntoId);
+  if (flashIds) {
+    const set = new Set(flashIds);
+    cards = cards.filter(c => set.has(c.id));
+  }
+  if (cards.length === 0) return null;
+
+  const doc = new JsPDF({ unit: "mm", format: "a4" });
+  const nome = (assunto && assunto.nome) || "Flashcards";
+  const hoje = new Date().toLocaleDateString("pt-BR");
+
+  if (formato === "cartoes") {
+    pdfMontarCartoes(doc, cards);
+  } else {
+    const sub = `${materia ? pdfLimparTexto(materia.nome) + "  |  " : ""}${cards.length} flashcard${cards.length === 1 ? "" : "s"}  |  ${hoje}`;
+    pdfMontarLista(doc, cards, pdfLimparTexto(nome) || "Flashcards", sub);
+  }
+
+  // rodapé com numeração
+  const total = doc.getNumberOfPages();
+  const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight();
+  for (let p = 1; p <= total; p++) {
+    doc.setPage(p);
+    doc.setFont("helvetica", "normal").setFontSize(8).setTextColor(150);
+    doc.text(`Pagina ${p} de ${total}`, W / 2, H - 5, { align: "center" });
+  }
+
+  return {
+    blob: doc.output("blob"),
+    nomeArquivo: `flashcards-${pdfSlug(nome)}-${formato === "cartoes" ? "cartoes-" : ""}${new Date().toISOString().slice(0, 10)}.pdf`,
+    quantidade: cards.length,
+  };
+}
+
+function abrirModalExportarPdf({ assuntoId, flashIds = null }) {
+  const n = flashIds ? flashIds.length : null;
+  openModal(`
+    <h3 class="modal-title">${n ? `Exportar ${n} flashcard${n === 1 ? "" : "s"} em PDF` : "Exportar flashcards em PDF"}</h3>
+    <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 14px;">
+      Escolha como quer o arquivo:
+    </p>
+    <div class="modal-field">
+      <label style="display:flex; gap:8px; align-items:flex-start; cursor:pointer;">
+        <input type="radio" name="pdf-formato" value="lista" checked style="margin-top:3px;">
+        <span><b>📄 Lista para estudar</b><br><span style="font-size:12.5px; color:var(--text-secondary);">Pergunta e resposta, uma abaixo da outra.</span></span>
+      </label>
+    </div>
+    <div class="modal-field">
+      <label style="display:flex; gap:8px; align-items:flex-start; cursor:pointer;">
+        <input type="radio" name="pdf-formato" value="cartoes" style="margin-top:3px;">
+        <span><b>✂️ Cartões para imprimir</b><br><span style="font-size:12.5px; color:var(--text-secondary);">8 por página, com páginas de frente e verso alternadas. Imprima em frente e verso (borda longa) e recorte.</span></span>
+      </label>
+    </div>
+    <p id="pdf-status" style="font-size:13px; color:var(--text-secondary); margin:0 0 4px;" hidden></p>
+    <div class="modal-actions">
+      <button class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
+      <button class="btn-primary" id="btn-gerar-pdf">Gerar PDF</button>
+    </div>
+  `);
+
+  document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
+  document.getElementById("btn-gerar-pdf").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const status = document.getElementById("pdf-status");
+    const formato = document.querySelector('input[name="pdf-formato"]:checked').value;
+    btn.disabled = true;
+    status.hidden = false;
+    status.textContent = "Gerando o PDF (precisa de internet na primeira vez)...";
+    try {
+      let resultado;
+      try {
+        resultado = await gerarPdfFlashcards({ assuntoId, flashIds, formato });
+      } catch (err) {
+        if (!window.jspdf) {
+          console.error(err);
+          status.textContent = "Não consegui baixar a biblioteca de PDF. Confira sua conexão e tente de novo.";
+          btn.disabled = false;
+          return;
+        }
+        throw err;
+      }
+      if (!resultado) {
+        status.textContent = "Não há flashcards para exportar.";
+        btn.disabled = false;
+        return;
+      }
+      const url = URL.createObjectURL(resultado.blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = resultado.nomeArquivo;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      closeModal();
+      showToast(`PDF gerado com ${resultado.quantidade} flashcard${resultado.quantidade === 1 ? "" : "s"} 📄`);
+    } catch (err) {
+      console.error("Erro ao exportar PDF:", err);
+      status.textContent = "Erro ao gerar o PDF. Abra o console (F12) para ver os detalhes.";
+      btn.disabled = false;
+    }
+  });
+}
+
+/* ---------- PDF das questões: todas as imagens em um único arquivo ---------- */
+
+// Converte a imagem salva (PNG/JPG/WEBP) em JPEG para o PDF, reduzindo imagens gigantes.
+async function pdfImagemParaDataURL(blob, maxLado = 2200) {
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise((res, rej) => {
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = () => rej(new Error("Imagem ilegível"));
+      i.src = url;
+    });
+    const esc = Math.min(1, maxLado / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * esc));
+    const h = Math.max(1, Math.round(img.naturalHeight * esc));
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    return { data: c.toDataURL("image/jpeg", 0.9), w, h };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+// itens: [{ grupo, rotulo, img: {data,w,h} | null, resposta, comentario }]
+function pdfMontarQuestoes(doc, itens, { titulo, subtitulo, umaPorPagina, incluirTexto }) {
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const M = 12, larg = W - 2 * M, fundo = H - M - 4;
+  let y = M;
+
+  const novaPagina = () => { doc.addPage(); y = M; };
+  const garantir = (alt) => { if (y + alt > fundo) novaPagina(); };
+
+  doc.setFont("helvetica", "bold").setFontSize(16).setTextColor(30);
+  const lt = doc.splitTextToSize(titulo, larg);
+  doc.text(lt, M, y + 5);
+  y += lt.length * 7 + 2;
+  doc.setFont("helvetica", "normal").setFontSize(9.5).setTextColor(130);
+  doc.text(subtitulo, M, y + 3);
+  y += 7;
+  doc.setDrawColor(...PDF_COR_DESTAQUE).setLineWidth(0.6).line(M, y, W - M, y);
+  y += 7;
+
+  const escreverTexto = (rotulo, txt) => {
+    const t = pdfLimparTexto(txt);
+    if (!t) return;
+    doc.setFont("helvetica", "bold").setFontSize(10);
+    const linhas = doc.splitTextToSize(`${rotulo}: ${t}`, larg);
+    linhas.forEach((ln) => {
+      garantir(5);
+      doc.setFont("helvetica", "normal").setFontSize(10).setTextColor(70);
+      doc.text(ln, M, y + 3.5);
+      y += 4.8;
+    });
+    y += 1.5;
+  };
+
+  let grupoAtual = null, primeiro = true;
+  itens.forEach((it) => {
+    if (umaPorPagina && !primeiro) novaPagina();
+    primeiro = false;
+
+    if (it.grupo && it.grupo !== grupoAtual) {
+      grupoAtual = it.grupo;
+      garantir(24);
+      doc.setFont("helvetica", "bold").setFontSize(12.5).setTextColor(...PDF_COR_DESTAQUE);
+      doc.text(doc.splitTextToSize(grupoAtual, larg), M, y + 4);
+      y += 9;
+    }
+
+    let dw = 0, dh = 0;
+    if (it.img) {
+      dw = Math.min(larg, it.img.w * 25.4 / 96); // não aumenta imagens pequenas além do tamanho natural
+      dh = dw * it.img.h / it.img.w;
+      const maxH = fundo - M - 8;
+      if (dh > maxH) { dh = maxH; dw = dh * it.img.w / it.img.h; }
+    }
+    garantir(7 + (it.img ? dh : 6));
+
+    doc.setFont("helvetica", "bold").setFontSize(10).setTextColor(...PDF_COR_DESTAQUE);
+    doc.text(it.rotulo, M, y + 4);
+    y += 6.5;
+
+    if (it.img) {
+      doc.addImage(it.img.data, "JPEG", M, y, dw, dh, undefined, "FAST");
+      doc.setDrawColor(225).setLineWidth(0.2).rect(M, y, dw, dh);
+      y += dh + 3;
+    } else if (!it.imgErro) {
+      doc.setFont("helvetica", "italic").setFontSize(9.5).setTextColor(150);
+      doc.text("(sem imagem)", M, y + 3.5);
+      y += 6;
+    } else {
+      doc.setFont("helvetica", "italic").setFontSize(9.5).setTextColor(180, 60, 60);
+      doc.text("(nao foi possivel ler a imagem)", M, y + 3.5);
+      y += 6;
+    }
+
+    if (incluirTexto) {
+      escreverTexto("Resposta", it.resposta);
+      escreverTexto("Comentario", it.comentario);
+    }
+    y += 6;
+  });
+}
+
+async function gerarPdfQuestoes({ assuntoId, escopo, incluirTexto, umaPorPagina, onProgresso }) {
+  const JsPDF = await carregarJsPDF();
+  const assunto = await dbGet("assuntos", assuntoId);
+  const materia = assunto ? getMateriaById(assunto.materiaId) : null;
+
+  let assuntos = [assunto];
+  if (escopo === "materia" && assunto) {
+    assuntos = await dbGetAll("assuntos", "materiaId", assunto.materiaId);
+    assuntos.sort((a, b) => (a.ordem ?? a.criadoEm ?? a.id) - (b.ordem ?? b.criadoEm ?? b.id));
+  }
+
+  const itens = [];
+  let comImagem = 0;
+  for (const ass of assuntos) {
+    const questoes = await getQuestoesOrdenadas(ass.id);
+    for (let i = 0; i < questoes.length; i++) {
+      const q = questoes[i];
+      const temTexto = !!((q.resposta || "").trim() || (q.comentario || "").trim());
+      if (!q.imagem && !(incluirTexto && temTexto)) continue;
+      const item = {
+        grupo: escopo === "materia" ? pdfLimparTexto(ass.nome) : null,
+        rotulo: `Questao ${i + 1}`,
+        img: null, resposta: q.resposta, comentario: q.comentario,
+      };
+      if (q.imagem) {
+        try {
+          item.img = await pdfImagemParaDataURL(q.imagem);
+          comImagem++;
+        } catch (err) {
+          console.warn("Imagem ignorada:", err);
+          item.imgErro = true;
+        }
+      }
+      itens.push(item);
+      if (onProgresso) onProgresso(itens.length);
+    }
+  }
+  if (itens.length === 0) return null;
+
+  const doc = new JsPDF({ unit: "mm", format: "a4" });
+  const nomeBase = escopo === "materia" ? (materia ? materia.nome : "Questoes") : ((assunto && assunto.nome) || "Questoes");
+  const hoje = new Date().toLocaleDateString("pt-BR");
+  pdfMontarQuestoes(doc, itens, {
+    titulo: pdfLimparTexto(nomeBase) || "Questoes",
+    subtitulo: `${materia && escopo !== "materia" ? pdfLimparTexto(materia.nome) + "  |  " : ""}${itens.length} questao(oes)  |  ${hoje}`,
+    umaPorPagina, incluirTexto,
+  });
+
+  const total = doc.getNumberOfPages();
+  const W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight();
+  for (let p = 1; p <= total; p++) {
+    doc.setPage(p);
+    doc.setFont("helvetica", "normal").setFontSize(8).setTextColor(150);
+    doc.text(`Pagina ${p} de ${total}`, W / 2, H - 5, { align: "center" });
+  }
+
+  return {
+    blob: doc.output("blob"),
+    nomeArquivo: `questoes-${pdfSlug(nomeBase)}-${new Date().toISOString().slice(0, 10)}.pdf`,
+    quantidade: itens.length,
+    comImagem,
+  };
+}
+
+function abrirModalExportarPdfQuestoes(assuntoId) {
+  openModal(`
+    <h3 class="modal-title">Exportar questões em PDF</h3>
+    <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 14px;">
+      Todas as imagens das questões juntas em um único PDF, na ordem em que foram cadastradas
+      (os filtros da tela não são aplicados).
+    </p>
+    <div class="modal-field">
+      <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
+        <input type="radio" name="pdfq-escopo" value="assunto" checked> Só este assunto
+      </label>
+    </div>
+    <div class="modal-field">
+      <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
+        <input type="radio" name="pdfq-escopo" value="materia"> Todos os assuntos desta matéria
+      </label>
+    </div>
+    <div class="modal-field">
+      <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
+        <input type="checkbox" id="pdfq-texto"> Incluir resposta e comentário abaixo de cada imagem
+      </label>
+    </div>
+    <div class="modal-field">
+      <label style="display:flex; gap:8px; align-items:center; cursor:pointer;">
+        <input type="checkbox" id="pdfq-pagina"> Uma questão por página
+      </label>
+    </div>
+    <p id="pdfq-status" style="font-size:13px; color:var(--text-secondary); margin:0 0 4px;" hidden></p>
+    <div class="modal-actions">
+      <button class="btn-secondary" id="btn-cancel-modal">Cancelar</button>
+      <button class="btn-primary" id="btn-gerar-pdfq">Gerar PDF</button>
+    </div>
+  `);
+
+  document.getElementById("btn-cancel-modal").addEventListener("click", closeModal);
+  document.getElementById("btn-gerar-pdfq").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const status = document.getElementById("pdfq-status");
+    const escopo = document.querySelector('input[name="pdfq-escopo"]:checked').value;
+    const incluirTexto = document.getElementById("pdfq-texto").checked;
+    const umaPorPagina = document.getElementById("pdfq-pagina").checked;
+    btn.disabled = true;
+    status.hidden = false;
+    status.textContent = "Preparando o PDF (precisa de internet na primeira vez)...";
+    try {
+      let r;
+      try {
+        r = await gerarPdfQuestoes({
+          assuntoId, escopo, incluirTexto, umaPorPagina,
+          onProgresso: (n) => { status.textContent = `Processando questão ${n}...`; },
+        });
+      } catch (err) {
+        if (!window.jspdf) {
+          console.error(err);
+          status.textContent = "Não consegui baixar a biblioteca de PDF. Confira sua conexão e tente de novo.";
+          btn.disabled = false;
+          return;
+        }
+        throw err;
+      }
+      if (!r) {
+        status.textContent = "Não encontrei questões com imagem para exportar.";
+        btn.disabled = false;
+        return;
+      }
+      const url = URL.createObjectURL(r.blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = r.nomeArquivo;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      closeModal();
+      showToast(`PDF gerado com ${r.quantidade} questão${r.quantidade === 1 ? "" : "ões"} 📄`);
+    } catch (err) {
+      console.error("Erro ao exportar PDF das questões:", err);
+      status.textContent = "Erro ao gerar o PDF. Se forem muitas imagens, tente por assunto. Veja o console (F12).";
+      btn.disabled = false;
+    }
+  });
+}
 
 /* ============================================================
    11B. ROTEIROS (CONCURSOS) — vários roteiros separados
@@ -3322,7 +4860,7 @@ function confirmarExcluirMateria(materiaId) {
   openModal(`
     <h3 class="modal-title">Excluir "${escapeHTML(materia.nome)}"?</h3>
     <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 4px;">
-      Isso apaga os assuntos dessa matéria, com todos os PDFs, questões, flashcards e anotações, além dos tópicos do checklist.
+      Isso apaga os assuntos dessa matéria, com todos os PDFs, questões e flashcards, além dos tópicos do checklist.
       Essa ação não pode ser desfeita.
     </p>
     <div class="modal-actions">
@@ -3351,7 +4889,7 @@ function confirmarExcluirConcurso(concursoId) {
   openModal(`
     <h3 class="modal-title">Excluir o roteiro "${escapeHTML(c.nome)}"?</h3>
     <p style="font-size:13.5px; color:var(--text-secondary); margin:0 0 4px;">
-      Todas as matérias, assuntos, PDFs, questões, flashcards, anotações, tópicos do checklist e o cronograma
+      Todas as matérias, assuntos, PDFs, questões, flashcards, tópicos do checklist e o cronograma
       <b>deste roteiro</b> serão apagados. Os outros roteiros não são afetados. Essa ação não pode ser desfeita.
     </p>
     <div class="modal-actions">
